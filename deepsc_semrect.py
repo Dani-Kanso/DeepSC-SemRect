@@ -16,11 +16,16 @@ class DeepSCWithSemRect(nn.Module):
         super(DeepSCWithSemRect, self).__init__()
         
         # Initialize DeepSC
-        self.deepsc = DeepSC(num_layers, src_vocab_size, trg_vocab_size, src_max_len,
-                             trg_max_len, d_model, num_heads, dff, dropout)
+        self.deepsc = DeepSC(num_layers, src_vocab_size, trg_vocab_size, src_max_len + 1,
+                             trg_max_len + 1, d_model, num_heads, dff, dropout)
         
-        # Initialize SemRect
-        self.semrect = SemRect(latent_dim=semrect_latent_dim, device=device)
+        # Initialize SemRect with matching dimensions
+        self.semrect = SemRect(
+            latent_dim=semrect_latent_dim,
+            output_dim=d_model,  # Match DeepSC's d_model dimension
+            seq_len=src_max_len + 1,  # Match sequence length including the extra token
+            device=device
+        )
         
         # Dimensionality of semantic representation (output of channel decoder)
         self.semantic_dim = d_model
@@ -35,32 +40,15 @@ class DeepSCWithSemRect(nn.Module):
         self.to(device)
         
     def forward(self, src, trg, noise_std, channel_type='AWGN', use_semrect=True):
-        """
-        Forward pass through the entire model.
-        
-        Args:
-            src: Source sequence (batch_size, src_seq_len)
-            trg: Target sequence (batch_size, trg_seq_len)
-            noise_std: Channel noise standard deviation
-            channel_type: Type of channel ('AWGN', 'Rayleigh', 'Rician')
-            use_semrect: Whether to use SemRect for defense
-            
-        Returns:
-            output: Output logits (batch_size, trg_seq_len, vocab_size)
-        """
         # Create masks
-        src_mask, look_ahead_mask = create_masks(src, trg[:, :-1], 0)  # Assuming 0 is pad_idx
+        src_mask, look_ahead_mask = create_masks(src, trg[:, :-1], 0)
         
-        # Encoder
+        # Encoder and channel processing 
         enc_output = self.deepsc.encoder(src, src_mask)
-        
-        # Channel encoder
         channel_enc_output = self.deepsc.channel_encoder(enc_output)
-        
-        # Power normalization
         Tx_sig = PowerNormalize(channel_enc_output)
         
-        # Channel
+        # Channel simulation
         if channel_type == 'AWGN':
             Rx_sig = self.channels.AWGN(Tx_sig, noise_std)
         elif channel_type == 'Rayleigh':
@@ -70,18 +58,15 @@ class DeepSCWithSemRect(nn.Module):
         else:
             raise ValueError("Please choose from AWGN, Rayleigh, and Rician")
         
-        # Channel decoder
+        # Channel decoder to get semantic representation
         semantic_repr = self.deepsc.channel_decoder(Rx_sig)
         
-        # Apply SemRect for defense
+        # Apply SemRect only if explicitly requested
         if use_semrect:
-            # Calibrate semantic representation using SemRect
             semantic_repr = self.semrect.calibrate(semantic_repr)
-        
-        # Decoder
+            
+        # Decoder and output generation
         dec_output = self.deepsc.decoder(trg[:, :-1], semantic_repr, look_ahead_mask, src_mask)
-        
-        # Final linear layer
         output = self.deepsc.dense(dec_output)
         
         return output
@@ -328,4 +313,4 @@ if __name__ == "__main__":
     adv_improvement = ((results['adversarial_with_defense'] - results['adversarial_no_defense']) / 
                       results['adversarial_no_defense']) * 100 if results['adversarial_no_defense'] > 0 else float('inf')
     
-    print(f"\nSemRect improves adversarial robustness by {adv_improvement:.2f}%") 
+    print(f"\nSemRect improves adversarial robustness by {adv_improvement:.2f}%")

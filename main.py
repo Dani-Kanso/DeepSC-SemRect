@@ -80,10 +80,10 @@ def validate(epoch, args, net):
                 loss = val_step(net, sents, sents, 0.1, pad_idx,
                                 criterion, args.channel)
 
-            total += loss.item()
+            total += loss
             pbar.set_description(
                 'Epoch: {}; Type: VAL; Loss: {:.5f}'.format(
-                    epoch + 1, loss.item()
+                    epoch + 1, loss
                 )
             )
 

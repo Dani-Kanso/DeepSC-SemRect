@@ -8,6 +8,7 @@
 import os
 import json
 import torch
+import torch.nn as nn  # Add this import
 import argparse
 import numpy as np
 from dataset import EurDataset, collate_data
@@ -189,7 +190,9 @@ def greedy_decode_with_semrect(model, src, noise_std, max_len, pad_idx, start_sy
             rx_sig = channels.Rayleigh(tx_sig, noise_std)
         elif channel_type == 'Rician':
             rx_sig = channels.Rician(tx_sig, noise_std)
-            
+        else:
+            raise ValueError("Please choose from AWGN, Rayleigh, and Rician")
+        
         # Channel decoder to get semantic representation
         semantic_repr = model.deepsc.channel_decoder(rx_sig)
     
@@ -198,22 +201,26 @@ def greedy_decode_with_semrect(model, src, noise_std, max_len, pad_idx, start_sy
         # Enable gradients for attack
         semantic_repr = semantic_repr.detach().clone().requires_grad_(True)
         
-        # Create a dummy target - goal is to maximize loss (misclassification)
+        # Create a dummy target with matching sequence length
         batch_size = src.size(0)
-        dummy_trg = torch.ones(batch_size, 1, dtype=torch.long).to(device) * start_symbol
+        seq_len = semantic_repr.size(1)
+        dummy_trg = torch.ones(batch_size, seq_len, dtype=torch.long).to(device) * start_symbol
         
         # Forward pass with the semantic representation
         dummy_out = model.deepsc.decoder(dummy_trg, semantic_repr, None, src_mask)
         dummy_logits = model.deepsc.dense(dummy_out)
         
-        # This will be used to create an FGSM-style attack
         # Pick a random target different from the predicted class
+        vocab_size = dummy_logits.size(-1)  # Get the vocabulary size
         pred_class = dummy_logits.argmax(dim=-1)
-        random_target = (pred_class + torch.randint(1, pred_class.shape[-1], pred_class.shape).to(device)) % pred_class.shape[-1]
         
-        # Compute loss
-        criterion = torch.nn.CrossEntropyLoss()
-        loss = criterion(dummy_logits.squeeze(1), random_target.squeeze(1))
+        # Generate random target indices avoiding the predicted class
+        random_offset = torch.randint(1, max(2, vocab_size - 1), pred_class.shape, device=device)
+        random_target = (pred_class + random_offset) % vocab_size
+        
+        # Compute loss for gradient calculation
+        criterion = nn.CrossEntropyLoss()
+        loss = criterion(dummy_logits.reshape(-1, vocab_size), random_target.reshape(-1))
         
         # Compute gradients
         loss.backward()
@@ -226,7 +233,17 @@ def greedy_decode_with_semrect(model, src, noise_std, max_len, pad_idx, start_sy
     # Step 3: Apply SemRect calibration if enabled
     if use_semrect:
         with torch.no_grad():
+            # Ensure semantic_repr has proper shape before calibration
+            B, seq_len, d_model = semantic_repr.size()
             semantic_repr = model.semrect.calibrate(semantic_repr)
+            # Ensure output maintains the same shape
+            if semantic_repr.size(1) != seq_len:
+                if semantic_repr.size(1) > seq_len:
+                    semantic_repr = semantic_repr[:, :seq_len, :]
+                else:
+                    pad_len = seq_len - semantic_repr.size(1)
+                    padding = torch.zeros(B, pad_len, d_model, device=semantic_repr.device)
+                    semantic_repr = torch.cat([semantic_repr, padding], dim=1)
     
     # Step 4: Decode the sentence
     with torch.no_grad():
@@ -243,7 +260,7 @@ def greedy_decode_with_semrect(model, src, noise_std, max_len, pad_idx, start_sy
             # Concatenate with output sequence
             ys = torch.cat([ys, next_word], dim=1)
             
-            # Stop if we hit EOS token
+            # Stop if we hit pad token
             if (next_word == pad_idx).all():
                 break
                 
@@ -386,7 +403,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     SNR = [0,3,6,9,12,15,18]
 
-    args.vocab_file = '/import/antennas/Datasets/hx301/' + args.vocab_file
+    args.vocab_file = '/content/data/txt/' + args.vocab_file
     vocab = json.load(open(args.vocab_file, 'rb'))
     token_to_idx = vocab['token_to_idx']
     idx_to_token = dict(zip(token_to_idx.values(), token_to_idx.keys()))

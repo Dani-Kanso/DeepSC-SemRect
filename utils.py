@@ -201,13 +201,33 @@ def create_masks(src, trg, padding_idx):
     return src_mask.to(device), combined_mask.to(device)
 
 def loss_function(x, trg, padding_idx, criterion):
+    """
+    Calculate masked loss function for cross-entropy loss.
+    Properly handles both scalar and per-element losses.
     
+    Args:
+        x: Predicted logits [batch_size * seq_len, vocab_size]
+        trg: Target tokens [batch_size * seq_len]
+        padding_idx: Index of the padding token
+        criterion: Loss criterion (CrossEntropyLoss)
+    
+    Returns:
+        Masked mean loss value
+    """
+    # Get loss (either scalar or per-element based on reduction mode)
     loss = criterion(x, trg)
-    mask = (trg != padding_idx).type_as(loss.data)
-    # a = mask.cpu().numpy()
-    loss *= mask
     
-    return loss.mean()
+    # Create mask for padding tokens
+    mask = (trg != padding_idx).float()
+    
+    # Check if loss is already reduced to scalar
+    if loss.dim() == 0:  # Scalar loss (reduction='mean' or 'sum')
+        # Just return the scalar loss without masking
+        return loss
+    else:  # Per-element loss (reduction='none')
+        # Apply masking and take mean of non-masked elements
+        loss = loss * mask
+        return loss.sum() / mask.sum().clamp(min=1.0)  # Avoid division by zero
 
 def PowerNormalize(x):
     
@@ -253,15 +273,24 @@ def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None
     dec_output = model.decoder(trg_inp, channel_dec_output, look_ahead_mask, src_mask)
     pred = model.dense(dec_output)
     
-    # pred = model(src, trg_inp, src_mask, look_ahead_mask, n_var)
     ntokens = pred.size(-1)
     
-    #y_est = x +  torch.matmul(n, torch.inverse(H))
-    #loss1 = torch.mean(torch.pow((x_est - y_est.view(x_est.shape)), 2))
-
+    # Get original reduction mode from criterion to handle both scalar and per-element losses
+    original_reduction = getattr(criterion, 'reduction', 'mean')
+    
+    # Temporarily set to 'none' if it supports setting reduction
+    if hasattr(criterion, 'reduction'):
+        temp_reduction = criterion.reduction
+        criterion.reduction = 'none'
+    
+    try:
     loss = loss_function(pred.contiguous().view(-1, ntokens), 
                          trg_real.contiguous().view(-1), 
                          pad, criterion)
+    finally:
+        # Restore original reduction mode
+        if hasattr(criterion, 'reduction'):
+            criterion.reduction = temp_reduction
 
     if mi_net is not None:
         mi_net.eval()
@@ -269,7 +298,6 @@ def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None
         mi_lb, _, _ = mutual_information(joint, marginal, mi_net)
         loss_mine = -mi_lb
         loss = loss + 0.0009 * loss_mine
-    # loss = loss_function(pred, trg_real, pad)
 
     loss.backward()
     opt.step()
@@ -329,12 +357,24 @@ def val_step(model, src, trg, n_var, pad, criterion, channel):
     dec_output = model.decoder(trg_inp, channel_dec_output, look_ahead_mask, src_mask)
     pred = model.dense(dec_output)
 
-    # pred = model(src, trg_inp, src_mask, look_ahead_mask, n_var)
     ntokens = pred.size(-1)
+    
+    # Get original reduction mode from criterion to handle both scalar and per-element losses
+    original_reduction = getattr(criterion, 'reduction', 'mean')
+    
+    # Temporarily set to 'none' if it supports setting reduction
+    if hasattr(criterion, 'reduction'):
+        temp_reduction = criterion.reduction
+        criterion.reduction = 'none'
+    
+    try:
     loss = loss_function(pred.contiguous().view(-1, ntokens), 
                          trg_real.contiguous().view(-1), 
                          pad, criterion)
-    # loss = loss_function(pred, trg_real, pad)
+    finally:
+        # Restore original reduction mode
+        if hasattr(criterion, 'reduction'):
+            criterion.reduction = temp_reduction
     
     return loss.item()
     

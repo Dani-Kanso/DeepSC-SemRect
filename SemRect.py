@@ -1,52 +1,79 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.utils import spectral_norm
 
 class SemanticGenerator(nn.Module):
     def __init__(self, latent_dim=100, output_dim=128, seq_len=31):
-        super(SemanticGenerator, self).__init__()
+        super().__init__()
         self.latent_dim = latent_dim
-        self.output_dim = output_dim
         self.seq_len = seq_len
+        self.output_dim = output_dim
         
-        # Project latent vector and reshape for sequential data
-        self.project = nn.Sequential(
-            nn.Linear(latent_dim, output_dim * seq_len),
-            nn.LayerNorm(output_dim * seq_len)
+        # Encode input semantic representation
+        self.encoder = nn.Sequential(
+            nn.Linear(output_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.ReLU()
         )
         
-        # Process with sequence awareness
-        self.net = nn.Sequential(
-            nn.Linear(output_dim * seq_len, output_dim * seq_len),
-            nn.ReLU(inplace=True),
-            nn.Linear(output_dim * seq_len, output_dim * seq_len),
-            nn.ReLU(inplace=True),
-            nn.Linear(output_dim * seq_len, output_dim * seq_len),
+        # Project latent vector to sequence
+        self.project = nn.Linear(latent_dim, seq_len * output_dim)
+        
+        # Use LSTM for sequence generation
+        self.lstm = nn.LSTM(output_dim, output_dim, num_layers=2, batch_first=True)
+        
+        # Final projection with residual connection
+        self.final = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim)
         )
     
-    def forward(self, z, target_seq_len=None):
+    def forward(self, h=None, z=None, target_seq_len=None):
         """
-        Forward pass with dynamic sequence length support
+        Forward pass with dependency on input semantic representation
+        
         Args:
-            z: Input latent vector (batch_size, latent_dim)
+            h: Input semantic representation [batch_size, seq_len, output_dim]
+            z: Optional random noise vector [batch_size, latent_dim]
             target_seq_len: Optional target sequence length
         """
-        B = z.size(0)
-        seq_len = target_seq_len if target_seq_len is not None else self.seq_len
+        if h is None and z is None:
+            raise ValueError("Either h or z must be provided")
+            
+        if h is not None:
+            B = h.size(0)
+            # Get sequence-aware encoding by pooling across sequence
+            h_mean = h.mean(dim=1)  # [B, output_dim]
+            h_enc = self.encoder(h_mean)  # [B, latent_dim]
+        else:
+            B = z.size(0)
+            h_enc = torch.zeros(B, self.latent_dim, device=z.device)
+            
+        # Generate or use provided random component
+        if z is None:
+            z = torch.randn(B, self.latent_dim, device=h_enc.device)
+            
+        # Combine semantic encoding with random noise
+        combined = h_enc + z  # [B, latent_dim]
         
-        # Initial projection
-        x = self.project(z)
-        x = self.net(x)
+        # Project to sequence
+        x = self.project(combined)  # [B, seq_len*output_dim]
+        x = x.view(B, self.seq_len, self.output_dim)  # [B, seq_len, output_dim]
         
-        # Reshape to target sequence length
-        x = x.view(B, self.seq_len, self.output_dim)
+        # Process with LSTM for sequence-aware generation
+        x, _ = self.lstm(x)  # [B, seq_len, output_dim]
+        
+        # Final projection
+        x = self.final(x)  # [B, seq_len, output_dim]
         
         # Adjust sequence length if needed
-        if target_seq_len and target_seq_len != self.seq_len:
-            if target_seq_len < self.seq_len:
-                x = x[:, :target_seq_len, :]
+        seq_len = target_seq_len if target_seq_len is not None else self.seq_len
+        if seq_len != self.seq_len:
+            if seq_len < self.seq_len:
+                x = x[:, :seq_len, :]
             else:
-                padding = torch.zeros(B, target_seq_len - self.seq_len, self.output_dim, 
+                padding = torch.zeros(B, seq_len - self.seq_len, self.output_dim, 
                                    device=x.device)
                 x = torch.cat([x, padding], dim=1)
         
@@ -55,39 +82,55 @@ class SemanticGenerator(nn.Module):
 class SemanticDiscriminator(nn.Module):
     def __init__(self, input_dim=128, seq_len=31):
         super(SemanticDiscriminator, self).__init__()
+        
+        # Use spectral normalization for stability
         self.net = nn.Sequential(
-            nn.Linear(input_dim * seq_len, 512),
+            # Initial convolutional layer for sequence processing
+            nn.Conv1d(input_dim, 64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(512, 256),
+            
+            # Downsample with strided convolution
+            spectral_norm(nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(256, 128),
+            
+            # Another downsampling
+            spectral_norm(nn.Conv1d(128, 256, kernel_size=3, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(128, 1)
+            
+            # Final layers
+            nn.Flatten(),
+            spectral_norm(nn.Linear(256 * ((seq_len//4) + (1 if seq_len % 4 != 0 else 0)), 512)),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Linear(512, 1))
         )
     
     def forward(self, x):
         # x shape: (batch, seq_len, input_dim)
-        x = x.view(x.size(0), -1)  # Flatten sequence and features
+        # Transpose to (batch, input_dim, seq_len) for Conv1d
+        x = x.transpose(1, 2)
         return self.net(x)
 
-class SemRect:
+class SemRect(nn.Module):  
     def __init__(self, latent_dim=100, output_dim=128, seq_len=31,
-                 device=torch.device('cpu')):
+                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
+        super(SemRect, self).__init__()  
         self.latent_dim = latent_dim
         self.device = device
         self.G = SemanticGenerator(latent_dim, output_dim, seq_len).to(device)
         self.D = SemanticDiscriminator(output_dim, seq_len).to(device)
         self.adv_loss = nn.BCEWithLogitsLoss()
         self.recon_loss = nn.MSELoss()
+        self.to(device) 
     
-    def calibrate(self, h_adv, z_steps=10, z_lr=1e-2):
+    def calibrate(self, h_adv, z_steps=15, z_lr=1e-2, alpha=0.3):
         """
-        Calibrate potentially corrupted semantic representation with improved semantic preservation.
+        Calibrate potentially corrupted semantic representation using semantic signature.
         
         Args:
-            h_adv: Input semantic representation (batch, seq_len, output_dim)
+            h_adv: Input semantic representation [batch, seq_len, output_dim]
             z_steps: Number of optimization steps
             z_lr: Learning rate for z optimization
+            alpha: Weight for signature correction (higher = stronger correction)
         """
         # Detach h_adv and ensure it's on the correct device
         h_adv = h_adv.detach().to(self.device)
@@ -95,12 +138,13 @@ class SemRect:
         # Get target sequence length from input
         B, seq_len, output_dim = h_adv.size()
         
-        # Initialize z on the correct device with gradients
+        # Initialize z with random noise
         z = torch.randn(B, self.latent_dim, device=self.device)
         z.requires_grad_(True)
         
-        # Ensure generator is in eval mode
-        self.G.eval()
+        # Save original training state and set to training mode for backward pass
+        was_training = self.G.training
+        self.G.train()  # Need training mode for cudnn RNN backward
         
         # Create optimizer for z
         opt_z = torch.optim.Adam([z], lr=z_lr)
@@ -111,22 +155,24 @@ class SemRect:
         layer_norm = nn.LayerNorm((seq_len, output_dim)).to(self.device)
         h_adv_norm = layer_norm(h_adv)
         
+        # Phase 1: Find optimal latent code through iterative optimization
         for step in range(z_steps):
             opt_z.zero_grad()
             
-            # Forward pass through generator with target sequence length
+            # Generate signature with h_adv conditioning
             with torch.enable_grad():
-                x_rec = self.G(z, target_seq_len=seq_len)
+                x_rec = self.G(h_adv, z, target_seq_len=seq_len)
                 x_rec_norm = layer_norm(x_rec)
                 
                 # Compute reconstruction loss with normalized tensors
                 recon_loss = self.recon_loss(x_rec_norm, h_adv_norm)
                 
-                # Add semantic preservation loss
-                sem_loss = torch.mean(torch.abs(x_rec - h_adv))
+                # Discriminator-based "reality" loss to ensure semantic validity
+                d_score = self.D(x_rec).mean()
+                reality_loss = -d_score  # Maximize discriminator score
                 
                 # Total loss with weighted components
-                loss = recon_loss + 0.1 * sem_loss
+                loss = recon_loss + 0.1 * reality_loss
             
             # Store best result
             if loss.item() < min_loss:
@@ -134,14 +180,31 @@ class SemRect:
                 best_z = z.clone()
             
             # Backward pass for z optimization
-            loss.backward()
+            loss.backward(retain_graph=True)
             opt_z.step()
+            
+            # Clear gradients after each step
+            if z.grad is not None:
+                z.grad.zero_()
 
-        # Use best found z for final reconstruction with residual connection
+        # Phase 2: Generate and apply the semantic signature 
         with torch.no_grad():
-            final_output = self.G(best_z, target_seq_len=seq_len)
-            # Add residual connection to preserve semantic information
-            final_output = 0.8 * h_adv + 0.2 * final_output
+            # Generate semantic signature based on best latent code
+            signature = self.G(h_adv, best_z, target_seq_len=seq_len)
+            
+            # Apply adaptive signature strength based on detection confidence
+            # Higher correction where reconstruction loss is lower (more confident)
+            detection_confidence = torch.sigmoid(torch.tensor(-min_loss * 5, device=self.device))  # Convert loss to confidence
+            adaptive_alpha = alpha * detection_confidence
+            
+            # Apply signature with residual connection
+            final_output = (1 - adaptive_alpha) * h_adv + adaptive_alpha * signature
+            
+            # Add normalization to ensure stable semantic range
+            final_output = layer_norm(final_output) * h_adv.std(dim=(1,2), keepdim=True)
+        
+        # Restore original training state
+        self.G.train(was_training)
             
         return final_output
     
@@ -173,7 +236,7 @@ class SemRect:
 
                 # D step
                 z = torch.randn(B, self.latent_dim, device=self.device)
-                fake_repr = self.G(z)  # Will match real_repr shape
+                fake_repr = self.G(real_repr, z)  # Will match real_repr shape
                 
                 d_real = self.D(real_repr)
                 d_fake = self.D(fake_repr.detach())

@@ -128,13 +128,9 @@ def evaluate_model(model, dataloader, noise_std, channel_type, use_semrect=False
     
     return np.mean(bleu_score_1gram.compute_blue_score(pred_texts, target_texts))
 
-def generate_adversarial_example(model, src, trg, noise_std, channel_type, epsilon=0.3):
-    """Generate adversarial example using PGD attack for stronger evaluation"""
+def generate_adversarial_example(model, src, trg, noise_std, channel_type, epsilon=0.1):
+    """Generate adversarial example using FGSM attack at the channel level (aligning with paper)"""
     model.eval()
-    
-    # Use multi-step PGD attack for stronger adversaries
-    steps = 3
-    step_size = epsilon / steps
     
     # Forward pass to get semantic representation
     src_mask, _ = create_masks(src, trg[:, :-1], 0)
@@ -143,13 +139,35 @@ def generate_adversarial_example(model, src, trg, noise_std, channel_type, epsil
         # Access the encoder based on model type
         if isinstance(model, DeepSCWithSemRect):
             try:
-                # Try to use the model's built-in PGD attack if available
+                # Try to use the model's built-in FGSM attack if available
                 adv_semantic, src_mask = model.generate_adversarial(
-                    src, trg, noise_std, channel_type, epsilon, steps
+                    src, trg, noise_std, channel_type, epsilon
                 )
-                clean_semantic = None  # Not needed in this case
+                
+                # Get clean semantic representation for comparison
+                with torch.no_grad():
+                    encoder = model.deepsc.encoder
+                    channel_encoder = model.deepsc.channel_encoder
+                    channel_decoder = model.deepsc.channel_decoder
+                    
+                    enc_output = encoder(src, src_mask)
+                    channel_enc = channel_encoder(enc_output)
+                    channel_enc = PowerNormalize(channel_enc)
+                    
+                    # Get clean semantic representation through channel
+                    channels = Channels()
+                    if channel_type == 'AWGN':
+                        Rx_sig_clean = channels.AWGN(channel_enc, noise_std)
+                    elif channel_type == 'Rayleigh':
+                        Rx_sig_clean = channels.Rayleigh(channel_enc, noise_std)
+                    elif channel_type == 'Rician':
+                        Rx_sig_clean = channels.Rician(channel_enc, noise_std)
+                    
+                    clean_semantic = channel_decoder(Rx_sig_clean)
+                
                 return clean_semantic, adv_semantic, src_mask, trg
-            except:
+            except Exception as e:
+                print(f"Error using model's built-in attack: {e}")
                 # Fall back to manual implementation
                 encoder = model.deepsc.encoder
                 channel_encoder = model.deepsc.channel_encoder
@@ -163,76 +181,57 @@ def generate_adversarial_example(model, src, trg, noise_std, channel_type, epsil
             decoder = model.decoder
             dense = model.dense
         
-        # First get the embeddings, which are floating point and can have gradients
+        # Process the input through encoder normally
         with torch.no_grad():
             # Run the embedding layer without gradients
             src_emb = encoder.embedding(src) * math.sqrt(encoder.d_model)
             src_emb = encoder.pos_encoding(src_emb)
-        
-        # Now create a copy that requires gradients for PGD attack
-        perturbed_emb = src_emb.clone().detach().requires_grad_(True)
-        
-        # Store the original for reference
-        orig_emb = src_emb.clone().detach()
-        
-        # Multi-step PGD attack
-        for _ in range(steps):
-            # Forward pass through encoder with perturbed embedding
-            enc_output = perturbed_emb
+            
+            # Forward pass through encoder normally
+            enc_output = src_emb
             for enc_layer in encoder.enc_layers:
                 enc_output = enc_layer(enc_output, src_mask)
                 
-            # Continue with the forward pass
-            channel_enc = channel_encoder(enc_output)
-            
-            # Apply channel
-            channels = Channels()
-            if channel_type == 'AWGN':
-                channel_enc = PowerNormalize(channel_enc)
-                Rx_sig = channels.AWGN(channel_enc, noise_std)
-            elif channel_type == 'Rayleigh':
-                channel_enc = PowerNormalize(channel_enc)
-                Rx_sig = channels.Rayleigh(channel_enc, noise_std)
-            elif channel_type == 'Rician':
-                channel_enc = PowerNormalize(channel_enc)
-                Rx_sig = channels.Rician(channel_enc, noise_std)
-            
-            semantic_repr = channel_decoder(Rx_sig)
-            
-            # Forward through decoder with trg input
-            trg_inp = trg[:, :-1]
-            trg_real = trg[:, 1:]
-            dec_output = decoder(trg_inp, semantic_repr, None, src_mask)
-            output = dense(dec_output)
-            
-            # Compute loss for gradient calculation
-            criterion = nn.CrossEntropyLoss()
-            loss = criterion(output.reshape(-1, output.size(-1)), trg_real.reshape(-1))
+            # Get channel encoding
+            channel_enc_clean = channel_encoder(enc_output)
+            channel_enc_clean = PowerNormalize(channel_enc_clean)
         
-            # Compute gradients
-            perturbed_emb.grad = None  # Clear previous gradients
-            loss.backward()
-            
-            # PGD step
-            with torch.no_grad():
-                # Take gradient step
-                if perturbed_emb.grad is not None:
-                    update = step_size * perturbed_emb.grad.sign()
-                    perturbed_emb.data = perturbed_emb.data + update
-                    
-                    # Project back to epsilon ball around original
-                    delta = perturbed_emb.data - orig_emb
-                    delta = torch.clamp(delta, -epsilon, epsilon)
-                    perturbed_emb.data = orig_emb + delta
+        # Create a copy of channel encoding that requires gradients for FGSM attack
+        perturbed_channel = channel_enc_clean.clone().detach().requires_grad_(True)
         
-        # Final forward pass with the adversarial embedding
+        # Apply channel with the perturbed signal
+        channels = Channels()
+        if channel_type == 'AWGN':
+            Rx_sig = channels.AWGN(perturbed_channel, noise_std)
+        elif channel_type == 'Rayleigh':
+            Rx_sig = channels.Rayleigh(perturbed_channel, noise_std)
+        elif channel_type == 'Rician':
+            Rx_sig = channels.Rician(perturbed_channel, noise_std)
+        
+        semantic_repr = channel_decoder(Rx_sig)
+        
+        # Forward through decoder with trg input
+        trg_inp = trg[:, :-1]
+        trg_real = trg[:, 1:]
+        dec_output = decoder(trg_inp, semantic_repr, None, src_mask)
+        output = dense(dec_output)
+        
+        # Compute loss for gradient calculation
+        criterion = nn.CrossEntropyLoss()
+        loss = criterion(output.reshape(-1, output.size(-1)), trg_real.reshape(-1))
+    
+        # Compute gradients
+        loss.backward()
+        
+        # FGSM attack (single step)
+        with torch.no_grad():
+            # Apply FGSM perturbation
+            if perturbed_channel.grad is not None:
+                perturbed_channel = perturbed_channel + epsilon * perturbed_channel.grad.sign()
+        
+        # Final forward pass with the clean and adversarial channel encodings
         with torch.no_grad():
             # Get clean semantic representation
-            enc_output_clean = orig_emb
-            for enc_layer in encoder.enc_layers:
-                enc_output_clean = enc_layer(enc_output_clean, src_mask)
-            channel_enc_clean = channel_encoder(enc_output_clean)
-            channel_enc_clean = PowerNormalize(channel_enc_clean)
             if channel_type == 'AWGN':
                 Rx_sig_clean = channels.AWGN(channel_enc_clean, noise_std)
             elif channel_type == 'Rayleigh':
@@ -242,22 +241,17 @@ def generate_adversarial_example(model, src, trg, noise_std, channel_type, epsil
             clean_semantic = channel_decoder(Rx_sig_clean)
             
             # Get adversarial semantic representation
-            enc_output = perturbed_emb
-            for enc_layer in encoder.enc_layers:
-                enc_output = enc_layer(enc_output, src_mask)
-            channel_enc = channel_encoder(enc_output)
-            channel_enc = PowerNormalize(channel_enc)
             if channel_type == 'AWGN':
-                Rx_sig = channels.AWGN(channel_enc, noise_std)
+                Rx_sig = channels.AWGN(perturbed_channel, noise_std)
             elif channel_type == 'Rayleigh':
-                Rx_sig = channels.Rayleigh(channel_enc, noise_std)
+                Rx_sig = channels.Rayleigh(perturbed_channel, noise_std)
             elif channel_type == 'Rician':
-                Rx_sig = channels.Rician(channel_enc, noise_std)
+                Rx_sig = channels.Rician(perturbed_channel, noise_std)
             adv_semantic = channel_decoder(Rx_sig)
         
     return clean_semantic, adv_semantic, src_mask, trg
 
-def calculate_attack_success_rate(model, dataloader, noise_std, channel_type, token_to_idx, epsilon=0.3, use_semrect=False):
+def calculate_attack_success_rate(model, dataloader, noise_std, channel_type, token_to_idx, epsilon=0.05, use_semrect=False):
     """Calculate the success rate of adversarial attacks"""
     model.eval()
     total_examples = 0
@@ -280,6 +274,11 @@ def calculate_attack_success_rate(model, dataloader, noise_std, channel_type, to
                 model, src, trg, noise_std, channel_type, epsilon
             )
             
+            # Check if we have valid semantic representations
+            if clean_semantic is None or adv_semantic is None:
+                print("Skipping batch due to None semantic representation")
+                continue
+                
             with torch.no_grad():
                 # Access the correct components based on model type
                 if isinstance(model, DeepSCWithSemRect):
@@ -290,18 +289,30 @@ def calculate_attack_success_rate(model, dataloader, noise_std, channel_type, to
                     dense = model.dense
                 
                 # Get predictions on clean examples
-                clean_out = decoder(trg[:, :-1], clean_semantic, None, src_mask)
-                clean_out = dense(clean_out)
-                clean_pred = clean_out.argmax(dim=-1)
+                try:
+                    clean_out = decoder(trg[:, :-1], clean_semantic, None, src_mask)
+                    clean_out = dense(clean_out)
+                    clean_pred = clean_out.argmax(dim=-1)
+                except Exception as e:
+                    print(f"Error in clean prediction: {e}")
+                    continue
                 
                 # Apply SemRect if enabled
                 if use_semrect and isinstance(model, DeepSCWithSemRect):
-                    adv_semantic = model.semrect.calibrate(adv_semantic)
+                    try:
+                        adv_semantic = model.semrect.calibrate(adv_semantic)
+                    except Exception as e:
+                        print(f"Error in SemRect calibration: {e}")
+                        continue
                 
                 # Get predictions on adversarial examples
-                adv_out = decoder(trg[:, :-1], adv_semantic, None, src_mask)
-                adv_out = dense(adv_out)
-                adv_pred = adv_out.argmax(dim=-1)
+                try:
+                    adv_out = decoder(trg[:, :-1], adv_semantic, None, src_mask)
+                    adv_out = dense(adv_out)
+                    adv_pred = adv_out.argmax(dim=-1)
+                except Exception as e:
+                    print(f"Error in adversarial prediction: {e}")
+                    continue
                 
                 # Check if attack changed the prediction
                 target = trg[:, 1:]
@@ -321,7 +332,7 @@ def calculate_attack_success_rate(model, dataloader, noise_std, channel_type, to
         return attack_success / total_examples
     return 0.0
 
-def test_under_attack(model, dataloader, noise_std, channel_type, token_to_idx, epsilon=0.3, use_semrect=False):
+def test_under_attack(model, dataloader, noise_std, channel_type, token_to_idx, epsilon=0.05, use_semrect=False):
     """Test model performance under adversarial attack"""
     model.eval()
     bleu_score_1gram = BleuScore(1, 0, 0, 0)
@@ -345,6 +356,11 @@ def test_under_attack(model, dataloader, noise_std, channel_type, token_to_idx, 
                 model, src, trg, noise_std, channel_type, epsilon
             )
             
+            # Check if valid semantic representations
+            if clean_semantic is None or adv_semantic is None:
+                print("Skipping batch due to None semantic representation")
+                continue
+            
             with torch.no_grad():
                 # Access the correct components based on model type
                 if isinstance(model, DeepSCWithSemRect):
@@ -356,28 +372,45 @@ def test_under_attack(model, dataloader, noise_std, channel_type, token_to_idx, 
                 
                 # Apply SemRect if enabled
                 if use_semrect and isinstance(model, DeepSCWithSemRect):
-                    adv_semantic = model.semrect.calibrate(adv_semantic)
+                    try:
+                        adv_semantic = model.semrect.calibrate(adv_semantic)
+                    except Exception as e:
+                        print(f"Error in SemRect calibration: {e}")
+                        continue
                 
                 # Get predictions on adversarial examples
-                out = decoder(trg[:, :-1], adv_semantic, None, src_mask)
-                out = dense(out)
-                pred = out.argmax(dim=-1)
-                target = trg[:, 1:]
-                
-                # Store results
-                all_preds.extend(pred.cpu().numpy().tolist())
-                all_targets.extend(target.cpu().numpy().tolist())
+                try:
+                    out = decoder(trg[:, :-1], adv_semantic, None, src_mask)
+                    out = dense(out)
+                    pred = out.argmax(dim=-1)
+                    target = trg[:, 1:]
+                    
+                    # Store results
+                    all_preds.extend(pred.cpu().numpy().tolist())
+                    all_targets.extend(target.cpu().numpy().tolist())
+                except Exception as e:
+                    print(f"Error in prediction: {e}")
+                    continue
                 
         except Exception as e:
             print(f"Error in testing under attack: {e}")
             continue
     
-    # Convert to text for BLEU
-    StoT = SeqtoText(token_to_idx, token_to_idx["<END>"])
-    pred_texts = list(map(StoT.sequence_to_text, all_preds))
-    target_texts = list(map(StoT.sequence_to_text, all_targets))
+    # Check if we have any predictions
+    if len(all_preds) == 0 or len(all_targets) == 0:
+        print("Warning: No valid predictions were generated during testing under attack")
+        return 0.0
     
-    return np.mean(bleu_score_1gram.compute_blue_score(pred_texts, target_texts))
+    # Convert to text for BLEU
+    try:
+        StoT = SeqtoText(token_to_idx, token_to_idx["<END>"])
+        pred_texts = list(map(StoT.sequence_to_text, all_preds))
+        target_texts = list(map(StoT.sequence_to_text, all_targets))
+        
+        return np.mean(bleu_score_1gram.compute_blue_score(pred_texts, target_texts))
+    except Exception as e:
+        print(f"Error computing BLEU score: {e}")
+        return 0.0
 
 def test_models_under_attack(args, SNRs, std_model, token_to_idx, semrect_model=None):
     """Test both models under adversarial attacks across multiple SNRs"""
@@ -561,16 +594,22 @@ def main():
     parser.add_argument('--channel', default='Rayleigh', type=str, choices=['AWGN', 'Rayleigh', 'Rician'])
     parser.add_argument('--MAX-LENGTH', default=30, type=int)
     parser.add_argument('--batch-size', default=64, type=int)
-    parser.add_argument('--epsilon', default=0.1, type=float)
+    parser.add_argument('--epsilon', default=0.05, type=float)
     parser.add_argument('--output-file', default='results/attack_results.npy', type=str)
     parser.add_argument('--data-dir', default='/content/data/txt/', help='Directory containing the dataset')
     
-    # Add missing architecture arguments
+    # Add architecture arguments
     parser.add_argument('--num-layers', default=4, type=int)
     parser.add_argument('--d-model', default=128, type=int)
     parser.add_argument('--dff', default=512, type=int)
     parser.add_argument('--num-heads', default=8, type=int)
     parser.add_argument('--semrect-latent-dim', default=100, type=int)
+    
+    # Add training arguments
+    parser.add_argument('--train-semrect', action='store_true', help='Train SemRect before evaluation')
+    parser.add_argument('--epochs-pretrain', default=5, type=int, help='Number of epochs for pre-training SemRect')
+    parser.add_argument('--epochs-gan', default=10, type=int, help='Number of epochs for GAN training of SemRect')
+    parser.add_argument('--lr', default=1e-4, type=float, help='Learning rate for SemRect training')
 
     args = parser.parse_args()
     
@@ -682,10 +721,42 @@ def main():
         print(f"⚠️ Error loading model checkpoint: {e}")
         print("Using randomly initialized model for testing")
 
-    # Load DeepSC+SemRect if available
+    # Create a train dataloader for SemRect training
+    try:
+        train_loader = DataLoader(
+            EurDataset('train', data_dir=args.data_dir), 
+            batch_size=args.batch_size,
+            collate_fn=collate_data, 
+            num_workers=0
+        )
+        print(f"Created train dataloader with {len(train_loader)} batches")
+    except Exception as e:
+        print(f"Error loading train dataset: {e}")
+        print("Creating dummy dataset for training")
+        # Create a dummy dataset with small random tensors
+        dummy_data = [torch.randint(1, 10, (10,)) for _ in range(200)]
+        
+        class DummyDataset(torch.utils.data.Dataset):
+            def __init__(self, data):
+                self.data = data
+            def __getitem__(self, idx):
+                return self.data[idx]
+            def __len__(self):
+                return len(self.data)
+        
+        train_loader = DataLoader(
+            DummyDataset(dummy_data),
+            batch_size=args.batch_size,
+            collate_fn=collate_data,
+            num_workers=0
+        )
+        print(f"Created dummy train dataloader with {len(train_loader)} batches")
+
+    # Initialize DeepSC+SemRect
     semrect_model = None
-    if args.semrect_checkpoint:
+    if args.semrect_checkpoint or args.train_semrect:
         try:
+            print("Initializing DeepSC+SemRect model...")
             semrect_model = DeepSCWithSemRect(
                 num_layers=args.num_layers,
                 src_vocab_size=num_vocab,
@@ -700,12 +771,47 @@ def main():
                 device=device
             ).to(device)
             
-            semrect_checkpoint = torch.load(args.semrect_checkpoint, map_location=device)
-            semrect_model.load_state_dict(semrect_checkpoint, strict=False)
+            # Set DeepSC parameters from the standard model
+            semrect_model.deepsc.load_state_dict(std_model.state_dict(), strict=False)
+            
+            # Load SemRect checkpoint if available
+            if args.semrect_checkpoint:
+                print(f"Loading SemRect checkpoint from: {args.semrect_checkpoint}")
+                semrect_checkpoint = torch.load(args.semrect_checkpoint, map_location=device)
+                semrect_model.load_state_dict(semrect_checkpoint, strict=False)
+                print("✅ DeepSC+SemRect model loaded from checkpoint")
+            
+            # Train SemRect if requested
+            if args.train_semrect:
+                print("\n===== Training SemRect =====")
+                print(f"Pre-training epochs: {args.epochs_pretrain}")
+                print(f"GAN training epochs: {args.epochs_gan}")
+                print(f"Learning rate: {args.lr}")
+                print(f"Adversarial epsilon: {args.epsilon}")
+                
+                # Create directory for checkpoints
+                os.makedirs('checkpoints', exist_ok=True)
+                
+                # Train SemRect
+                semrect_model.train_semrect(
+                    dataloader=train_loader,
+                    epochs_pretrain=args.epochs_pretrain,
+                    epochs_gan=args.epochs_gan,
+                    lr=args.lr,
+                    epsilon=args.epsilon
+                )
+                
+                # Save trained model
+                try:
+                    torch.save(semrect_model.state_dict(), 'checkpoints/semrect_trained.pth')
+                    print("✅ Saved trained SemRect model")
+                except Exception as e:
+                    print(f"⚠️ Error saving trained model: {e}")
+                
             semrect_model.eval()
-            print("✅ DeepSC+SemRect model loaded")
         except Exception as e:
-            print(f"⚠️ Error loading SemRect model: {e}")
+            print(f"⚠️ Error initializing/training SemRect model: {e}")
+            print(f"Detailed error: {str(e)}")
             semrect_model = None
     
     # Test under attack

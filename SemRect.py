@@ -10,73 +10,34 @@ class SemanticGenerator(nn.Module):
         self.seq_len = seq_len
         self.output_dim = output_dim
         
-        # Encode input semantic representation
-        self.encoder = nn.Sequential(
-            nn.Linear(output_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.ReLU()
-        )
-        
-        # Project latent vector to sequence
-        self.project = nn.Linear(latent_dim, seq_len * output_dim)
-        
-        # Use LSTM for sequence generation
-        self.lstm = nn.LSTM(output_dim, output_dim, num_layers=2, batch_first=True)
-        
-        # Final projection with residual connection
-        self.final = nn.Sequential(
-            nn.Linear(output_dim, output_dim),
-            nn.LayerNorm(output_dim)
+        # Simple but effective generator architecture
+        self.main = nn.Sequential(
+            # Expand latent dim to hidden features
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Project to sequence length × feature dimension
+            nn.Linear(512, 1024),
+            nn.LayerNorm(1024),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Final projection to output dimension
+            nn.Linear(1024, seq_len * output_dim),
         )
     
-    def forward(self, h=None, z=None, target_seq_len=None):
+    def forward(self, z):
         """
-        Forward pass with dependency on input semantic representation
+        Forward pass to generate semantic representation from random vector
         
         Args:
-            h: Input semantic representation [batch_size, seq_len, output_dim]
-            z: Optional random noise vector [batch_size, latent_dim]
-            target_seq_len: Optional target sequence length
+            z: Random latent vector [batch_size, latent_dim]
+        Returns:
+            Semantic representation [batch_size, seq_len, output_dim]
         """
-        if h is None and z is None:
-            raise ValueError("Either h or z must be provided")
-            
-        if h is not None:
-            B = h.size(0)
-            # Get sequence-aware encoding by pooling across sequence
-            h_mean = h.mean(dim=1)  # [B, output_dim]
-            h_enc = self.encoder(h_mean)  # [B, latent_dim]
-        else:
-            B = z.size(0)
-            h_enc = torch.zeros(B, self.latent_dim, device=z.device)
-            
-        # Generate or use provided random component
-        if z is None:
-            z = torch.randn(B, self.latent_dim, device=h_enc.device)
-            
-        # Combine semantic encoding with random noise
-        combined = h_enc + z  # [B, latent_dim]
-        
-        # Project to sequence
-        x = self.project(combined)  # [B, seq_len*output_dim]
-        x = x.view(B, self.seq_len, self.output_dim)  # [B, seq_len, output_dim]
-        
-        # Process with LSTM for sequence-aware generation
-        x, _ = self.lstm(x)  # [B, seq_len, output_dim]
-        
-        # Final projection
-        x = self.final(x)  # [B, seq_len, output_dim]
-        
-        # Adjust sequence length if needed
-        seq_len = target_seq_len if target_seq_len is not None else self.seq_len
-        if seq_len != self.seq_len:
-            if seq_len < self.seq_len:
-                x = x[:, :seq_len, :]
-            else:
-                padding = torch.zeros(B, seq_len - self.seq_len, self.output_dim, 
-                                   device=x.device)
-                x = torch.cat([x, padding], dim=1)
-        
+        batch_size = z.size(0)
+        x = self.main(z)
+        x = x.view(batch_size, self.seq_len, self.output_dim)
         return x
 
 class SemanticDiscriminator(nn.Module):
@@ -111,145 +72,252 @@ class SemanticDiscriminator(nn.Module):
         return self.net(x)
 
 class SemRect(nn.Module):  
+    """
+    SemRect implementation as described in the paper:
+    A Defense-GAN approach that generates semantic signatures to 
+    calibrate adversarial perturbations.
+    """
     def __init__(self, latent_dim=100, output_dim=128, seq_len=31,
                  device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
         super(SemRect, self).__init__()  
         self.latent_dim = latent_dim
+        self.output_dim = output_dim
+        self.seq_len = seq_len
         self.device = device
+        
+        # Initialize generator and discriminator
         self.G = SemanticGenerator(latent_dim, output_dim, seq_len).to(device)
         self.D = SemanticDiscriminator(output_dim, seq_len).to(device)
+        
+        # Loss functions
         self.adv_loss = nn.BCEWithLogitsLoss()
         self.recon_loss = nn.MSELoss()
+        
         self.to(device) 
     
-    def calibrate(self, h_adv, z_steps=15, z_lr=1e-2, alpha=0.3):
+    def calibrate(self, h_adv, signature_scale=0.1):
         """
-        Calibrate potentially corrupted semantic representation using semantic signature.
+        Calibrate potentially corrupted semantic representation using 
+        a generated semantic signature.
         
         Args:
             h_adv: Input semantic representation [batch, seq_len, output_dim]
-            z_steps: Number of optimization steps
-            z_lr: Learning rate for z optimization
-            alpha: Weight for signature correction (higher = stronger correction)
+            signature_scale: Scaling factor for the signature
         """
-        # Detach h_adv and ensure it's on the correct device
-        h_adv = h_adv.detach().to(self.device)
+        batch_size = h_adv.size(0)
         
-        # Get target sequence length from input
-        B, seq_len, output_dim = h_adv.size()
+        # Generate random vector (z) for semantic signature
+        z = torch.randn(batch_size, self.latent_dim, device=self.device)
         
-        # Initialize z with random noise
-        z = torch.randn(B, self.latent_dim, device=self.device)
-        z.requires_grad_(True)
-        
-        # Save original training state and set to training mode for backward pass
-        was_training = self.G.training
-        self.G.train()  # Need training mode for cudnn RNN backward
-        
-        # Create optimizer for z
-        opt_z = torch.optim.Adam([z], lr=z_lr)
-        best_z = z.clone()
-        min_loss = float('inf')
-        
-        # Layer normalization for semantic stabilization
-        layer_norm = nn.LayerNorm((seq_len, output_dim)).to(self.device)
-        h_adv_norm = layer_norm(h_adv)
-        
-        # Phase 1: Find optimal latent code through iterative optimization
-        for step in range(z_steps):
-            opt_z.zero_grad()
-            
-            # Generate signature with h_adv conditioning
-            with torch.enable_grad():
-                x_rec = self.G(h_adv, z, target_seq_len=seq_len)
-                x_rec_norm = layer_norm(x_rec)
-                
-                # Compute reconstruction loss with normalized tensors
-                recon_loss = self.recon_loss(x_rec_norm, h_adv_norm)
-                
-                # Discriminator-based "reality" loss to ensure semantic validity
-                d_score = self.D(x_rec).mean()
-                reality_loss = -d_score  # Maximize discriminator score
-                
-                # Total loss with weighted components
-                loss = recon_loss + 0.1 * reality_loss
-            
-            # Store best result
-            if loss.item() < min_loss:
-                min_loss = loss.item()
-                best_z = z.clone()
-            
-            # Backward pass for z optimization
-            loss.backward(retain_graph=True)
-            opt_z.step()
-            
-            # Clear gradients after each step
-            if z.grad is not None:
-                z.grad.zero_()
-
-        # Phase 2: Generate and apply the semantic signature 
+        # Generate semantic signature using the trained generator
         with torch.no_grad():
-            # Generate semantic signature based on best latent code
-            signature = self.G(h_adv, best_z, target_seq_len=seq_len)
+            signature = self.G(z)
             
-            # Apply adaptive signature strength based on detection confidence
-            # Higher correction where reconstruction loss is lower (more confident)
-            detection_confidence = torch.sigmoid(torch.tensor(-min_loss * 5, device=self.device))  # Convert loss to confidence
-            adaptive_alpha = alpha * detection_confidence
-            
-            # Apply signature with residual connection
-            final_output = (1 - adaptive_alpha) * h_adv + adaptive_alpha * signature
-            
-            # Add normalization to ensure stable semantic range
-            final_output = layer_norm(final_output) * h_adv.std(dim=(1,2), keepdim=True)
+        # Apply the signature to calibrate adversarial input
+        calibrated = h_adv + signature_scale * signature
         
-        # Restore original training state
-        self.G.train(was_training)
-            
-        return final_output
+        return calibrated
     
-    def train_gan(self,
-                  semantic_encoder: nn.Module,
-                  dataloader: torch.utils.data.DataLoader,
-                  epochs: int = 50,
-                  lr: float = 1e-4):
-        semantic_encoder.eval()
-        for p in semantic_encoder.parameters(): p.requires_grad = False
-
-        opt_G = optim.Adam(self.G.parameters(), lr=lr)
-        opt_D = optim.Adam(self.D.parameters(), lr=lr)
-
+    def pretrain_generator(self, semantic_encoder, dataloader, epochs=5, lr=1e-4):
+        """
+        Pre-train generator on clean semantic representations as described in the paper.
+        This follows the Defense-GAN approach of training on clean data.
+        
+        Args:
+            semantic_encoder: Function/module to extract semantic representations
+            dataloader: Dataloader providing clean text inputs
+            epochs: Number of pre-training epochs
+            lr: Learning rate
+        """
+        print("Pre-training SemRect generator on clean semantic data...")
+        
+        # Set models to correct modes
+        self.G.train()
+        if hasattr(semantic_encoder, 'eval'):
+            semantic_encoder.eval()
+            
+        # Optimizer for generator
+        optimizer = optim.Adam(self.G.parameters(), lr=lr, betas=(0.5, 0.999))
+        
+        # Training loop
         for epoch in range(epochs):
-            for texts in dataloader:  # Changed to handle single value from dataloader
-                if not isinstance(texts, torch.Tensor):
-                    texts = texts[0]  # Handle case where dataloader might return a tuple/list
+            running_loss = 0.0
+            batch_count = 0
+            
+            for batch in dataloader:
+                # Handle different batch formats
+                if isinstance(batch, tuple) and len(batch) == 2:
+                    texts = batch[0]  # Assume source texts
+                else:
+                    texts = batch
                     
+                if not isinstance(texts, torch.Tensor):
+                    continue
+                    
+                # Move to device
                 texts = texts.to(self.device)
-                with torch.no_grad():
-                    # Get real semantic representation 
-                    # shape: (batch_size, seq_len, output_dim)
-                    real_repr = semantic_encoder(texts)
-
-                B = real_repr.size(0)
-                real_lbl = torch.ones(B, 1, device=self.device)
-                fake_lbl = torch.zeros(B, 1, device=self.device)
-
-                # D step
-                z = torch.randn(B, self.latent_dim, device=self.device)
-                fake_repr = self.G(real_repr, z)  # Will match real_repr shape
+                batch_size = texts.size(0)
+                batch_count += 1
                 
-                d_real = self.D(real_repr)
-                d_fake = self.D(fake_repr.detach())
-                d_loss = self.adv_loss(d_real, real_lbl) + self.adv_loss(d_fake, fake_lbl)
+                # Get clean semantic representation
+                with torch.no_grad():
+                    clean_repr = semantic_encoder(texts)
+                
+                # Generate semantic representation from random
+                z = torch.randn(batch_size, self.latent_dim, device=self.device)
+                fake_repr = self.G(z)
+                
+                # Reconstruction loss
+                loss = self.recon_loss(fake_repr, clean_repr)
+                
+                # Update generator
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item()
+                
+            # Print epoch stats
+            avg_loss = running_loss / max(batch_count, 1)
+            print(f"Pre-training epoch {epoch+1}/{epochs}, Avg Loss: {avg_loss:.4f}")
+    
+    def train_gan(self, semantic_encoder, dataloader, epochs=10, lr=1e-4, epsilon=0.1):
+        """
+        Train SemRect using the GAN approach as described in the paper.
+        Includes adversarial examples generation using FGSM.
+        
+        Args:
+            semantic_encoder: Function/module to extract semantic representations
+            dataloader: Dataloader providing clean text inputs
+            epochs: Number of training epochs
+            lr: Learning rate
+            epsilon: FGSM attack strength
+        """
+        print("Training SemRect GAN with adversarial examples...")
+        
+        # Set generator to training mode
+        self.G.train()
+        self.D.train()
+        
+        # Optimizers
+        opt_G = optim.Adam(self.G.parameters(), lr=lr, betas=(0.5, 0.999))
+        opt_D = optim.Adam(self.D.parameters(), lr=lr, betas=(0.5, 0.999))
+        
+        # For generating adversarial examples
+        def generate_adversarial(clean_repr, epsilon=0.1):
+            # Simple FGSM implementation as per paper
+            perturbed = clean_repr.clone().detach().requires_grad_(True)
+            
+            # Forward through discriminator
+            pred = self.D(perturbed)
+            
+            # Compute loss to maximize discriminator output
+            target = torch.zeros_like(pred)
+            loss = self.adv_loss(pred, target)
+            
+            # Get gradients
+            loss.backward()
+            
+            # FGSM attack
+            if perturbed.grad is not None:
+                adv_repr = perturbed + epsilon * perturbed.grad.sign()
+            else:
+                adv_repr = perturbed
+                
+            return adv_repr.detach()
+        
+        # Training loop
+        for epoch in range(epochs):
+            g_losses, d_losses = [], []
+            
+            for batch in dataloader:
+                # Handle different batch formats
+                if isinstance(batch, tuple) and len(batch) == 2:
+                    texts = batch[0]  # Assume source texts
+                else:
+                    texts = batch
+                    
+                if not isinstance(texts, torch.Tensor):
+                    continue
+                    
+                # Move to device
+                texts = texts.to(self.device)
+                batch_size = texts.size(0)
+                
+                # Get clean semantic representation
+                with torch.no_grad():
+                    clean_repr = semantic_encoder(texts)
+                
+                # Create adversarial examples
+                adv_repr = generate_adversarial(clean_repr, epsilon)
+                
+                # Labels for GAN training
+                real_label = torch.ones(batch_size, 1, device=self.device)
+                fake_label = torch.zeros(batch_size, 1, device=self.device)
+                
+                # ---------------
+                # Train Discriminator
+                # ---------------
                 opt_D.zero_grad()
+                
+                # Real samples
+                d_real = self.D(clean_repr)
+                d_real_loss = self.adv_loss(d_real, real_label)
+                
+                # Fake samples (generated signatures)
+                z = torch.randn(batch_size, self.latent_dim, device=self.device)
+                fake_repr = self.G(z)
+                d_fake = self.D(fake_repr.detach())
+                d_fake_loss = self.adv_loss(d_fake, fake_label)
+                
+                # Adversarial samples (for calibration)
+                # Calibrated = adversarial + signature
+                calibrated = adv_repr + 0.1 * fake_repr.detach()
+                d_cal = self.D(calibrated.detach())
+                d_cal_loss = self.adv_loss(d_cal, fake_label)
+                
+                # Total discriminator loss
+                d_loss = d_real_loss + 0.5 * (d_fake_loss + d_cal_loss)
                 d_loss.backward()
                 opt_D.step()
-
-                # G step
-                d_fake2 = self.D(fake_repr)
-                g_loss = self.adv_loss(d_fake2, real_lbl)
+                
+                # ---------------
+                # Train Generator
+                # ---------------
                 opt_G.zero_grad()
+                
+                # Adversarial loss (fool discriminator)
+                d_fake2 = self.D(fake_repr)
+                g_loss_adv = self.adv_loss(d_fake2, real_label)
+                
+                # Calibration loss (calibrated should be close to clean)
+                calibrated = adv_repr + 0.1 * fake_repr
+                g_loss_cal = self.recon_loss(calibrated, clean_repr)
+                
+                # Total generator loss
+                g_loss = g_loss_adv + 10.0 * g_loss_cal
                 g_loss.backward()
                 opt_G.step()
-
-            print(f"Epoch {epoch+1}/{epochs} D_loss={d_loss:.4f} G_loss={g_loss:.4f}")
+                
+                # Store losses
+                g_losses.append(g_loss.item())
+                d_losses.append(d_loss.item())
+            
+            # Print epoch stats
+            avg_g_loss = sum(g_losses) / max(len(g_losses), 1)
+            avg_d_loss = sum(d_losses) / max(len(d_losses), 1)
+            print(f"Epoch {epoch+1}/{epochs}, G_loss: {avg_g_loss:.4f}, D_loss: {avg_d_loss:.4f}")
+            
+            # Save checkpoint every few epochs
+            if (epoch + 1) % 5 == 0:
+                try:
+                    torch.save({
+                        'epoch': epoch,
+                        'g_state_dict': self.G.state_dict(),
+                        'd_state_dict': self.D.state_dict(),
+                    }, f"checkpoints/semrect_epoch_{epoch+1}.pth")
+                    print(f"Saved checkpoint at epoch {epoch+1}")
+                except:
+                    print("Could not save checkpoint")
+        
+        print("SemRect training complete!")

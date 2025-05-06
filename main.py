@@ -71,9 +71,9 @@ def validate(epoch, args, net, pad_idx, criterion):
             else:
                 loss = val_step(net, sents, sents, 0.1, pad_idx, criterion, args.channel)
 
-            total_loss += loss.item()
+            total_loss += loss
             pbar.set_description(
-                f'Epoch: {epoch+1}; VAL; Loss: {loss.item():.5f}'
+                f'Epoch: {epoch+1}; VAL; Loss: {loss:.5f}'
             )
     
     return total_loss / len(test_iterator)
@@ -115,7 +115,7 @@ def train_epoch(epoch, args, net, criterion, optimizer, pad_idx):
             loss = train_step(net, sents, sents, noise_std, pad_idx, optimizer, criterion, args.channel)
             pbar.set_description(f'Epoch: {epoch+1}; Train; Loss: {loss:.5f}')
         
-        total_loss += loss.item()
+        total_loss += loss
     
     return total_loss / len(train_loader)
 

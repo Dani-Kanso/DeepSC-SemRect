@@ -2,13 +2,17 @@ import torch
 import torch.nn as nn
 from models.transceiver import DeepSC
 from SemRect import SemRect
-from utils import SNR_to_noise, create_masks, PowerNormalize, Channels
+from utils import SNR_to_noise, create_masks, PowerNormalize, Channels, BleuScore
+import numpy as np
 
 class DeepSCWithSemRect(nn.Module):
     """
     Integration of DeepSC with SemRect for semantic integrity protection.
     SemRect is inserted between the channel decoder and the transformer decoder
-    to protect against adversarial perturbations.
+    to protect against adversarial perturbations using trained GAN-based signatures.
+    
+    This implementation follows the paper's description where SemRect uses a
+    Defense-GAN approach to generate semantic signatures that calibrate adversarial perturbations.
     """
     def __init__(self, num_layers, src_vocab_size, trg_vocab_size, src_max_len,
                  trg_max_len, d_model, num_heads, dff, dropout=0.1, 
@@ -19,7 +23,7 @@ class DeepSCWithSemRect(nn.Module):
         self.deepsc = DeepSC(num_layers, src_vocab_size, trg_vocab_size, src_max_len + 1,
                              trg_max_len + 1, d_model, num_heads, dff, dropout)
 
-        # Initialize SemRect with matching dimensions
+        # Initialize SemRect with Defense-GAN architecture
         self.semrect = SemRect(
             latent_dim=semrect_latent_dim,
             output_dim=d_model,
@@ -30,6 +34,31 @@ class DeepSCWithSemRect(nn.Module):
         # Device
         self.device = device
         self.to(device)
+        
+    def get_semantic_encoder(self):
+        """
+        Returns a callable that extracts semantic representations from input texts.
+        This is used for training SemRect.
+        """
+        class SemanticExtractor(nn.Module):
+            def __init__(self, deepsc_model, device):
+                super(SemanticExtractor, self).__init__()
+                self.encoder = deepsc_model.encoder
+                self.channel_encoder = deepsc_model.channel_encoder
+                self.channel_decoder = deepsc_model.channel_decoder
+                self.device = device
+
+            def forward(self, x):
+                # Create source mask
+                src_mask = (x == 0).unsqueeze(-2).type(torch.FloatTensor).to(x.device)
+                # Extract semantic representation
+                enc_output = self.encoder(x, src_mask)
+                channel_enc = self.channel_encoder(enc_output)
+                # No channel simulation during training
+                semantic_repr = self.channel_decoder(channel_enc)  
+                return semantic_repr
+                
+        return SemanticExtractor(self.deepsc, self.device)
 
     def forward(self, src, trg, noise_std, channel_type='AWGN', use_semrect=True):
         # Create masks
@@ -64,197 +93,214 @@ class DeepSCWithSemRect(nn.Module):
         output = self.deepsc.dense(dec_output)
         return output
 
-    def train_semrect(self, dataloader, epochs=50, lr=1e-4):
+    def generate_adversarial(self, src, trg, noise_std, channel_type, epsilon):
         """
-        Train SemRect on clean semantic representations (no channel effects).
-        Uses WGAN-GP style training for stability.
+        Generate adversarial examples using FGSM (Fast Gradient Sign Method)
+        as described in the SemRect paper.
         """
-        class SemanticExtractor(nn.Module):
-            def __init__(self, deepsc_model):
-                super(SemanticExtractor, self).__init__()
-                self.encoder = deepsc_model.encoder
-                self.channel_encoder = deepsc_model.channel_encoder
-                self.channel_decoder = deepsc_model.channel_decoder
-
-            def forward(self, x):
-                src_mask = (x == 0).unsqueeze(-2).type(torch.FloatTensor).to(x.device)
-                enc_output = self.encoder(x, src_mask)
-                channel_enc = self.channel_encoder(enc_output)
-                semantic_repr = self.channel_decoder(channel_enc)  # No channel effects
-                return semantic_repr
+        self.eval()
         
-        def compute_gradient_penalty(D, real_samples, fake_samples):
-            """Compute WGAN-GP gradient penalty"""
-            # Random weight for interpolation
-            alpha = torch.randn(real_samples.size(0), 1, 1, device=self.device)
+        # Create masks
+        src_mask, _ = create_masks(src, trg[:, :-1], 0)
+        
+        # Forward pass through encoder
+        enc_output = self.deepsc.encoder(src, src_mask)
+        
+        # Channel encoder
+        channel_enc = self.deepsc.channel_encoder(enc_output)
+        channel_enc_clean = PowerNormalize(channel_enc.clone())  # Save clean version
+        channel_enc = PowerNormalize(channel_enc)
+        
+        # Set requires_grad to true for attack
+        channel_enc.requires_grad_(True)
+        
+        # Forward through channel
+        channels = Channels()
+        if channel_type == 'AWGN':
+            Rx_sig = channels.AWGN(channel_enc, noise_std)
+        elif channel_type == 'Rayleigh':
+            Rx_sig = channels.Rayleigh(channel_enc, noise_std)
+        elif channel_type == 'Rician':
+            Rx_sig = channels.Rician(channel_enc, noise_std)
+        else:
+            # Default to AWGN if unknown channel type
+            Rx_sig = channels.AWGN(channel_enc, noise_std)
+        
+        # Channel decoder
+        semantic_repr = self.deepsc.channel_decoder(Rx_sig)
+        
+        # Forward through decoder 
+        dec_output = self.deepsc.decoder(trg[:, :-1], semantic_repr, None, src_mask)
+        output = self.deepsc.dense(dec_output)
+        
+        # Compute loss
+        criterion = nn.CrossEntropyLoss()
+        loss = criterion(output.reshape(-1, output.size(-1)), trg[:, 1:].reshape(-1))
+        
+        # Get gradient sign for FGSM attack
+        loss.backward()
+        
+        # Create adversarial example using FGSM
+        with torch.no_grad():
+            if channel_enc.grad is not None:
+                adv_channel = channel_enc + epsilon * channel_enc.grad.sign()
+            else:
+                # If no gradient, use the original channel encoding with small random noise
+                adv_channel = channel_enc + epsilon * torch.randn_like(channel_enc)
+                
+            # Forward through channel with adversarial input
+            if channel_type == 'AWGN':
+                adv_Rx_sig = channels.AWGN(adv_channel, noise_std)
+            elif channel_type == 'Rayleigh':
+                adv_Rx_sig = channels.Rayleigh(adv_channel, noise_std)
+            elif channel_type == 'Rician':
+                adv_Rx_sig = channels.Rician(adv_channel, noise_std)
+            else:
+                # Default to AWGN if unknown channel type
+                adv_Rx_sig = channels.AWGN(adv_channel, noise_std)
             
-            # Interpolated samples
-            interpolates = alpha * real_samples + (1 - alpha) * fake_samples
-            interpolates.requires_grad_(True)
+            # Get adversarial semantic representation
+            adv_semantic = self.deepsc.channel_decoder(adv_Rx_sig)
             
-            # Get discriminator output for interpolated samples
-            d_interpolates = D(interpolates)
-            
-            # Compute gradients
-            fake = torch.ones(d_interpolates.size(), device=self.device)
-            gradients = torch.autograd.grad(
-                outputs=d_interpolates,
-                inputs=interpolates,
-                grad_outputs=fake,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-            
-            # Compute gradient penalty
-            gradients = gradients.reshape(gradients.size(0), -1)
-            gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-            return gradient_penalty
-
-        # Freeze DeepSC
+        return adv_semantic, src_mask
+        
+    def train_semrect(self, dataloader, epochs=None, epochs_pretrain=5, epochs_gan=10, lr=1e-4, epsilon=0.1):
+        """
+        Train SemRect using the two-phase approach described in the paper:
+        1. Pre-train the generator on clean semantic data
+        2. Train the GAN with adversarial examples
+        
+        Args:
+            dataloader: DataLoader providing text data
+            epochs: If provided, will be used for both pretrain and GAN phases (overrides epochs_pretrain and epochs_gan)
+            epochs_pretrain: Number of pre-training epochs
+            epochs_gan: Number of GAN training epochs
+            lr: Learning rate
+            epsilon: FGSM attack strength
+        """
+        print("Training SemRect...")
+        
+        # If epochs is provided, use it for both phases
+        if epochs is not None:
+            epochs_pretrain = epochs
+            epochs_gan = epochs
+        
+        # Freeze DeepSC parameters during SemRect training
         for param in self.deepsc.parameters():
             param.requires_grad = False
-
-        semantic_extractor = SemanticExtractor(self.deepsc)
+            
+        # Create semantic encoder for training
+        semantic_encoder = self.get_semantic_encoder()
         
-        # Optimizers with different learning rates
-        opt_g = torch.optim.Adam(self.semrect.G.parameters(), lr=lr, betas=(0.5, 0.9))
-        opt_d = torch.optim.Adam(self.semrect.D.parameters(), lr=lr*2, betas=(0.5, 0.9))
+        # Phase 1: Pre-train generator on clean data
+        self.semrect.pretrain_generator(semantic_encoder, dataloader, epochs=epochs_pretrain, lr=lr)
         
-        # Training loop
-        for epoch in range(epochs):
-            g_losses = []
-            d_losses = []
-            
-            for i, texts in enumerate(dataloader):
-                if not isinstance(texts, torch.Tensor):
-                    texts = texts[0]  # Handle case where dataloader might return a tuple/list
-                    
-                texts = texts.to(self.device)
-                with torch.no_grad():
-                    # Get real semantic representation 
-                    real_repr = semantic_extractor(texts)
-
-                batch_size = real_repr.size(0)
-                
-                # Train discriminator more frequently for stability
-                for _ in range(2):  # Multiple D updates per G update
-                    opt_d.zero_grad()
-                    
-                    # Real samples
-                    d_real = self.semrect.D(real_repr)
-                    d_real_loss = -torch.mean(d_real)  # WGAN loss
-                    
-                    # Fake samples
-                    z = torch.randn(batch_size, self.semrect.latent_dim, device=self.device)
-                    fake_repr = self.semrect.G(real_repr, z)
-                    d_fake = self.semrect.D(fake_repr.detach())
-                    d_fake_loss = torch.mean(d_fake)  # WGAN loss
-                    
-                    # Gradient penalty
-                    gp = compute_gradient_penalty(self.semrect.D, real_repr, fake_repr.detach())
-                    
-                    # Total D loss
-                    d_loss = d_real_loss + d_fake_loss + 10.0 * gp
-                    d_loss.backward()
-                    opt_d.step()
-                
-                # Train generator
-                opt_g.zero_grad()
-                fake_repr = self.semrect.G(real_repr, z)
-                g_loss_adv = -torch.mean(self.semrect.D(fake_repr))  # WGAN adversarial loss
-                
-                # Reconstruction loss
-                g_loss_rec = torch.nn.functional.mse_loss(fake_repr, real_repr)
-                
-                # Combined loss
-                g_loss = g_loss_adv + 10.0 * g_loss_rec
-                g_loss.backward()
-                opt_g.step()
-                
-                # Track losses
-                g_losses.append(g_loss.item())
-                d_losses.append(d_loss.item())
-                
-                # Print progress for larger batches
-                if i % 10 == 0:
-                    print(f"Batch {i}/{len(dataloader)}: D={d_loss.item():.4f}, G={g_loss.item():.4f}")
-            
-            # Print epoch summary
-            avg_d_loss = sum(d_losses) / len(d_losses)
-            avg_g_loss = sum(g_losses) / len(g_losses)
-            print(f"Epoch {epoch+1}/{epochs} D_loss={avg_d_loss:.4f} G_loss={avg_g_loss:.4f}")
-            
-            # Save checkpoint periodically
-            if (epoch+1) % 5 == 0:
-                torch.save(self.state_dict(), f"checkpoints/semrect_epoch_{epoch+1}.pth")
-
-        # Optionally unfreeze DeepSC after training
+        # Phase 2: Train GAN with adversarial examples
+        self.semrect.train_gan(semantic_encoder, dataloader, epochs=epochs_gan, lr=lr, epsilon=epsilon)
+        
+        # Unfreeze DeepSC parameters
         for param in self.deepsc.parameters():
             param.requires_grad = True
+            
+        print("SemRect training complete!")
 
     def test_with_adversarial_attack(self, dataloader, epsilon=0.1, channel_type='AWGN', snr=10):
         """
         Test model robustness under FGSM adversarial attacks.
+        Returns attack success rate and BLEU scores.
         """
         noise_std = SNR_to_noise(snr)
-        results = {
-            'clean_no_defense': self._evaluate(dataloader, noise_std, channel_type, use_semrect=False),
-            'clean_with_defense': self._evaluate(dataloader, noise_std, channel_type, use_semrect=True),
-            'adversarial_no_defense': self._evaluate_with_attack(dataloader, noise_std, channel_type, epsilon, use_semrect=False),
-            'adversarial_with_defense': self._evaluate_with_attack(dataloader, noise_std, channel_type, epsilon, use_semrect=True)
-        }
-        return results
+        total_samples = 0
+        attack_success = 0
+        
+        # Create a SeqtoText converter
+        # Note: This needs to be updated with your actual token_to_idx dictionary
+        token_to_idx = getattr(self, 'token_to_idx', {'<PAD>': 0, '<END>': 2})
+        bleu_score_1gram = BleuScore(1, 0, 0, 0)
+        
+        class SeqtoText:
+            def __init__(self, token_to_idx, end_idx):
+                self.token_to_idx = token_to_idx
+                self.idx_to_token = {v: k for k, v in token_to_idx.items()}
+                self.end_idx = end_idx
 
-    def _evaluate(self, dataloader, noise_std, channel_type, use_semrect=True):
+            def sequence_to_text(self, sequence):
+                tokens = [self.idx_to_token.get(idx, "<UNK>") for idx in sequence if idx != self.token_to_idx.get("<PAD>", 0)]
+                if self.end_idx in sequence:
+                    end_idx = sequence.index(self.end_idx)
+                    tokens = [self.idx_to_token.get(idx, "<UNK>") for idx in sequence[:end_idx]]
+                return " ".join(tokens)
+                
+        StoT = SeqtoText(token_to_idx, token_to_idx.get("<END>", 2))
+        
+        # For BLEU score calculation
+        all_preds_clean = []
+        all_preds_adv = []
+        all_preds_defended = []
+        all_targets = []
+        
         self.eval()
-        total = correct = 0
         with torch.no_grad():
-            for src, trg in dataloader:
+            for batch in dataloader:
+                # Handle different return formats
+                if isinstance(batch, tuple) and len(batch) == 2:
+                    src, trg = batch
+                else:
+                    src = batch
+                    trg = src
+                
                 src, trg = src.to(self.device), trg.to(self.device)
-                output = self(src, trg, noise_std, channel_type, use_semrect)
-                pred = output.argmax(dim=-1)
-                target = trg[:, 1:]
-                mask = (target != 0)
-                correct += ((pred == target) * mask).sum().item()
-                total += mask.sum().item()
-        return correct / total if total > 0 else 0
-
-    def _evaluate_with_attack(self, dataloader, noise_std, channel_type, epsilon, use_semrect=True):
-        self.eval()
-        total = correct = 0
-        criterion = nn.CrossEntropyLoss()
-
-        for src, trg in dataloader:
-            src, trg = src.to(self.device), trg.to(self.device)
-            src.requires_grad = True
-
-            # Forward pass to compute loss for gradient
-            src_mask, _ = create_masks(src, trg[:, :-1], 0)
-            enc_output = self.deepsc.encoder(src, src_mask)
-            channel_enc = self.deepsc.channel_encoder(enc_output)
-            semantic_repr = self.deepsc.channel_decoder(channel_enc)
-
-            dummy_trg = trg[:, :-1]
-            dec_output = self.deepsc.decoder(dummy_trg, semantic_repr, None, src_mask)
-            logits = self.deepsc.dense(dec_output)
-            loss = criterion(logits.view(-1, logits.size(-1)), trg[:, 1:].view(-1))
-
-            # Backward to get gradients
-            loss.backward()
-
-            # Generate adversarial example
-            with torch.no_grad():
-                adv_semantic = semantic_repr + epsilon * semantic_repr.grad.sign()
-                if use_semrect:
-                    adv_semantic = self.semrect.calibrate(adv_semantic)
-
+                
+                # Generate adversarial examples using FGSM
+                adv_semantic, src_mask = self.generate_adversarial(src, trg, noise_std, channel_type, epsilon)
+                
+                # Get predictions on clean examples
+                output_clean = self(src, trg, noise_std, channel_type, use_semrect=False)
+                pred_clean = output_clean.argmax(dim=-1)
+                
+                # Get predictions on adversarial examples without defense
                 dec_output_adv = self.deepsc.decoder(trg[:, :-1], adv_semantic, None, src_mask)
                 output_adv = self.deepsc.dense(dec_output_adv)
-                pred = output_adv.argmax(dim=-1)
+                pred_adv = output_adv.argmax(dim=-1)
+                
+                # Get predictions on adversarial examples with SemRect defense
+                calibrated_semantic = self.semrect.calibrate(adv_semantic)
+                dec_output_def = self.deepsc.decoder(trg[:, :-1], calibrated_semantic, None, src_mask)
+                output_def = self.deepsc.dense(dec_output_def)
+                pred_def = output_def.argmax(dim=-1)
+                
+                # Calculate attack success rate (when prediction changes due to attack)
                 target = trg[:, 1:]
                 mask = (target != 0)
-                correct += ((pred == target) * mask).sum().item()
-                total += mask.sum().item()
-
-        return correct / total if total > 0 else 0
+                attack_changed = (pred_clean != pred_adv) & mask
+                attack_success += attack_changed.sum().item()
+                total_samples += mask.sum().item()
+                
+                # Store predictions for BLEU score
+                all_preds_clean.extend(pred_clean.cpu().numpy().tolist())
+                all_preds_adv.extend(pred_adv.cpu().numpy().tolist())
+                all_preds_defended.extend(pred_def.cpu().numpy().tolist())
+                all_targets.extend(target.cpu().numpy().tolist())
+        
+        # Calculate attack success rate
+        asr = attack_success / total_samples if total_samples > 0 else 0
+        
+        # Calculate BLEU scores
+        pred_texts_clean = list(map(StoT.sequence_to_text, all_preds_clean))
+        pred_texts_adv = list(map(StoT.sequence_to_text, all_preds_adv))
+        pred_texts_def = list(map(StoT.sequence_to_text, all_preds_defended))
+        target_texts = list(map(StoT.sequence_to_text, all_targets))
+        
+        bleu_clean = np.mean(bleu_score_1gram.compute_blue_score(pred_texts_clean, target_texts))
+        bleu_adv = np.mean(bleu_score_1gram.compute_blue_score(pred_texts_adv, target_texts))
+        bleu_def = np.mean(bleu_score_1gram.compute_blue_score(pred_texts_def, target_texts))
+        
+        results = {
+            'attack_success_rate': asr,
+            'bleu_clean': bleu_clean,
+            'bleu_adversarial': bleu_adv,
+            'bleu_defended': bleu_def,
+            'defense_effectiveness': (bleu_def - bleu_adv) / (bleu_clean - bleu_adv) if (bleu_clean - bleu_adv) != 0 else 0
+        }
+        
+        return results

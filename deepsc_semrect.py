@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from models.transceiver import DeepSC
 from SemRect import SemRect
-from SemRectFIM import SemRectFIM
 from utils import SNR_to_noise, create_masks, PowerNormalize, Channels, BleuScore
 import numpy as np
 
@@ -17,32 +16,20 @@ class DeepSCWithSemRect(nn.Module):
     """
     def __init__(self, num_layers, src_vocab_size, trg_vocab_size, src_max_len,
                  trg_max_len, d_model, num_heads, dff, dropout=0.1, 
-                 semrect_latent_dim=100, protection_type='semrect',
-                 device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
+                 semrect_latent_dim=100, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
         super(DeepSCWithSemRect, self).__init__()
         
         # Initialize DeepSC
         self.deepsc = DeepSC(num_layers, src_vocab_size, trg_vocab_size, src_max_len + 1,
                              trg_max_len + 1, d_model, num_heads, dff, dropout)
 
-        # Choose protection type
-        self.protection_type = protection_type
-        
-        # Initialize semantic protection module based on type
-        if protection_type == 'semrectfim':
-            self.semantic_protection = SemRectFIM(
-                latent_dim=semrect_latent_dim,
-                output_dim=d_model,
-                seq_len=src_max_len + 1,
-                device=device
-            )
-        else:  # default to semrect
-            self.semantic_protection = SemRect(
-                latent_dim=semrect_latent_dim,
-                output_dim=d_model,
-                seq_len=src_max_len + 1,
-                device=device
-            )
+        # Initialize SemRect with Defense-GAN architecture
+        self.semrect = SemRect(
+            latent_dim=semrect_latent_dim,
+            output_dim=d_model,
+            seq_len=src_max_len + 1,
+            device=device
+        )
 
         # Device
         self.device = device
@@ -73,7 +60,31 @@ class DeepSCWithSemRect(nn.Module):
                 
         return SemanticExtractor(self.deepsc, self.device)
 
-    def forward(self, src, trg, noise_std, channel_type='AWGN', use_protection=True, snr=None):
+    def forward(self, src, trg, noise_std, channel_type='AWGN', use_semrect=True, calibration_params=None):
+        # Default calibration parameters
+        if calibration_params is None:
+            calibration_params = {
+                'signature_scale': 0.1,
+                'num_iterations': 3
+            }
+            
+        # Adaptive calibration parameters based on noise level
+        if use_semrect and calibration_params.get('adaptive', True):
+            # Dynamically adjust signature scale based on noise level
+            # For higher noise, increase the signature contribution
+            snr = 20 * torch.log10(torch.tensor(1.0 / noise_std))
+            
+            # Scale signature contribution inversely with SNR
+            # Increase signature impact when SNR is low (high noise)
+            if snr < 5:  # Very noisy conditions
+                calibration_params['signature_scale'] = min(0.3, calibration_params.get('signature_scale', 0.1) * 3)
+                calibration_params['num_iterations'] = min(5, calibration_params.get('num_iterations', 3) + 2)
+            elif snr < 10:  # Moderately noisy
+                calibration_params['signature_scale'] = min(0.2, calibration_params.get('signature_scale', 0.1) * 2) 
+                calibration_params['num_iterations'] = min(4, calibration_params.get('num_iterations', 3) + 1)
+            elif snr > 20:  # Very clean conditions
+                calibration_params['signature_scale'] = max(0.05, calibration_params.get('signature_scale', 0.1) / 2)
+        
         # Create masks
         src_mask, look_ahead_mask = create_masks(src, trg[:, :-1], 0)
 
@@ -97,19 +108,13 @@ class DeepSCWithSemRect(nn.Module):
         # Channel decoder -> semantic representation
         semantic_repr = self.deepsc.channel_decoder(Rx_sig)
 
-        # Apply semantic protection if enabled
-        if use_protection:
-            # For SemRectFIM, we need to convert noise_std to SNR for better adaptation
-            if self.protection_type == 'semrectfim':
-                # If SNR not provided, estimate it from noise_std
-                if snr is None:
-                    # Simple approximation: SNR(dB) = 10*log10(1/noise_std^2) for normalized signal power
-                    snr_value = 10 * torch.log10(1 / (noise_std ** 2 + 1e-10))
-                    snr = snr_value * torch.ones((src.size(0), 1), device=self.device)
-                
-                semantic_repr = self.semantic_protection.calibrate(semantic_repr, snr)
-            else:
-                semantic_repr = self.semantic_protection.calibrate(semantic_repr)
+        # Apply SemRect if enabled
+        if use_semrect:
+            semantic_repr = self.semrect.calibrate(
+                semantic_repr, 
+                signature_scale=calibration_params['signature_scale'],
+                num_iterations=calibration_params['num_iterations']
+            )
 
         # Decoder and output
         dec_output = self.deepsc.decoder(trg[:, :-1], semantic_repr, look_ahead_mask, src_mask)
@@ -187,10 +192,11 @@ class DeepSCWithSemRect(nn.Module):
             
         return adv_semantic, src_mask
         
-    def train_protection_module(self, dataloader, epochs=None, epochs_pretrain=5, epochs_gan=10, 
-                               lr=1e-4, epsilon=0.1, snr_range=(0, 30)):
+    def train_semrect(self, dataloader, epochs=None, epochs_pretrain=5, epochs_gan=10, lr=1e-4, epsilon=0.1, noise_levels=None):
         """
-        Train the semantic protection module (SemRect or SemRectFIM).
+        Train SemRect using the two-phase approach described in the paper:
+        1. Pre-train the generator on clean semantic data
+        2. Train the GAN with adversarial examples
         
         Args:
             dataloader: DataLoader providing text data
@@ -199,72 +205,51 @@ class DeepSCWithSemRect(nn.Module):
             epochs_gan: Number of GAN training epochs
             lr: Learning rate
             epsilon: FGSM attack strength
-            snr_range: Range of SNR values for SemRectFIM training
+            noise_levels: List of noise standard deviations to use during training for robustness
         """
-        print(f"Training {self.protection_type.upper()}...")
+        print("Training SemRect...")
         
         # If epochs is provided, use it for both phases
         if epochs is not None:
             epochs_pretrain = epochs
             epochs_gan = epochs
         
-        # Freeze DeepSC parameters during protection module training
+        # Default noise levels if not provided
+        if noise_levels is None:
+            noise_levels = [0.1, 0.2, 0.3]  # Default noise levels for robustness
+            
+        # Freeze DeepSC parameters during SemRect training
         for param in self.deepsc.parameters():
             param.requires_grad = False
             
         # Create semantic encoder for training
         semantic_encoder = self.get_semantic_encoder()
         
-        # Training based on protection type
-        if self.protection_type == 'semrectfim':
-            # Phase 1: Pre-train generator on clean data with SNR awareness
-            self.semantic_protection.pretrain_generator(
-                semantic_encoder, 
-                dataloader, 
-                epochs=epochs_pretrain, 
-                lr=lr, 
-                snr_range=snr_range
-            )
-            
-            # Phase 2: Train GAN with adversarial examples and SNR awareness
-            self.semantic_protection.train_gan(
-                semantic_encoder, 
-                dataloader, 
-                epochs=epochs_gan, 
-                lr=lr, 
-                epsilon=epsilon, 
-                snr_range=snr_range
-            )
-        else:
-            # Standard SemRect training
-            # Phase 1: Pre-train generator on clean data
-            self.semantic_protection.pretrain_generator(
-                semantic_encoder, 
-                dataloader, 
-                epochs=epochs_pretrain, 
-                lr=lr
-            )
-            
-            # Phase 2: Train GAN with adversarial examples
-            self.semantic_protection.train_gan(
-                semantic_encoder, 
-                dataloader, 
-                epochs=epochs_gan, 
-                lr=lr, 
-                epsilon=epsilon
-            )
+        # Phase 1: Pre-train generator on clean data with noise augmentation
+        print(f"Pre-training with noise augmentation at levels: {noise_levels}")
+        self.semrect.pretrain_generator(semantic_encoder, dataloader, epochs=epochs_pretrain, lr=lr)
+        
+        # Phase 2: Train GAN with adversarial examples and multiple noise levels
+        self.semrect.train_gan(semantic_encoder, dataloader, epochs=epochs_gan, lr=lr, epsilon=epsilon)
         
         # Unfreeze DeepSC parameters
         for param in self.deepsc.parameters():
             param.requires_grad = True
             
-        print(f"{self.protection_type.upper()} training complete!")
+        print("SemRect training complete!")
 
-    def test_with_adversarial_attack(self, dataloader, epsilon=0.1, channel_type='AWGN', snr=10):
+    def test_with_adversarial_attack(self, dataloader, epsilon=0.1, channel_type='AWGN', snr=10, calibration_params=None):
         """
         Test model robustness under FGSM adversarial attacks.
         Returns attack success rate and BLEU scores.
         """
+        # Default calibration parameters
+        if calibration_params is None:
+            calibration_params = {
+                'signature_scale': 0.1,
+                'num_iterations': 3
+            }
+            
         noise_std = SNR_to_noise(snr)
         total_samples = 0
         attack_success = 0
@@ -310,11 +295,8 @@ class DeepSCWithSemRect(nn.Module):
                 # Generate adversarial examples using FGSM
                 adv_semantic, src_mask = self.generate_adversarial(src, trg, noise_std, channel_type, epsilon)
                 
-                # Convert noise_std to SNR tensor for SemRectFIM
-                snr_tensor = torch.tensor([[snr]], device=self.device).expand(src.size(0), 1)
-                
                 # Get predictions on clean examples
-                output_clean = self(src, trg, noise_std, channel_type, use_protection=False)
+                output_clean = self(src, trg, noise_std, channel_type, use_semrect=False)
                 pred_clean = output_clean.argmax(dim=-1)
                 
                 # Get predictions on adversarial examples without defense
@@ -322,12 +304,12 @@ class DeepSCWithSemRect(nn.Module):
                 output_adv = self.deepsc.dense(dec_output_adv)
                 pred_adv = output_adv.argmax(dim=-1)
                 
-                # Get predictions on adversarial examples with semantic protection
-                if self.protection_type == 'semrectfim':
-                    calibrated_semantic = self.semantic_protection.calibrate(adv_semantic, snr_tensor)
-                else:
-                    calibrated_semantic = self.semantic_protection.calibrate(adv_semantic)
-                    
+                # Get predictions on adversarial examples with SemRect defense
+                calibrated_semantic = self.semrect.calibrate(
+                    adv_semantic,
+                    signature_scale=calibration_params['signature_scale'],
+                    num_iterations=calibration_params['num_iterations']
+                )
                 dec_output_def = self.deepsc.decoder(trg[:, :-1], calibrated_semantic, None, src_mask)
                 output_def = self.deepsc.dense(dec_output_def)
                 pred_def = output_def.argmax(dim=-1)
@@ -359,8 +341,6 @@ class DeepSCWithSemRect(nn.Module):
         bleu_def = np.mean(bleu_score_1gram.compute_blue_score(pred_texts_def, target_texts))
         
         results = {
-            'protection_type': self.protection_type,
-            'snr': snr,
             'attack_success_rate': asr,
             'bleu_clean': bleu_clean,
             'bleu_adversarial': bleu_adv,

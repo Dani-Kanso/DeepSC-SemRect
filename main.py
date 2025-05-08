@@ -15,7 +15,6 @@ from utils import SNR_to_noise, initNetParams, train_step, val_step, train_mi
 from dataset import EurDataset, collate_data
 from models.transceiver import DeepSC
 from SemRect import SemRect
-from SemRectFIM import SemRectFIM
 from deepsc_semrect import DeepSCWithSemRect
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -32,15 +31,10 @@ parser.add_argument('--num-layers', default=4, type=int)
 parser.add_argument('--num-heads', default=8, type=int)
 parser.add_argument('--batch-size', default=128, type=int)
 parser.add_argument('--pretrain-epochs', default=50, type=int, help='Epochs for DeepSC pre-training')
-parser.add_argument('--protection-epochs', default=30, type=int, help='Epochs for semantic protection training')
+parser.add_argument('--semrect-epochs', default=30, type=int, help='Epochs for SemRect training')
 parser.add_argument('--finetune-epochs', default=1, type=int, help='Epochs for end-to-end fine-tuning')
-parser.add_argument('--use-protection', choices=['none', 'semrect', 'semrectfim'], default='none',
-                    help='Semantic protection type: none, semrect, or semrectfim')
-parser.add_argument('--semrect-latent-dim', default=100, type=int, help='Latent dimension for semantic protection')
-parser.add_argument('--snr-min', default=0, type=float, help='Minimum SNR value for training (dB)')
-parser.add_argument('--snr-max', default=30, type=float, help='Maximum SNR value for training (dB)')
-parser.add_argument('--test-snrs', default=[0, 5, 10, 15, 20], type=float, nargs='+', help='SNR values for testing')
-parser.add_argument('--compare-protections', action='store_true', help='Run comparison between SemRect and SemRectFIM')
+parser.add_argument('--use-semrect', action='store_true', help='Enable SemRect integration')
+parser.add_argument('--semrect-latent-dim', default=100, type=int, help='Latent dimension for SemRect')
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -66,8 +60,8 @@ def validate(epoch, args, net, pad_idx, criterion):
             sents = sents.to(device)
             
             if isinstance(net, DeepSCWithSemRect):
-                # Use semantic protection during validation
-                output = net(sents, sents, 0.1, args.channel, use_protection=True)
+                # Use semantic signature during validation
+                output = net(sents, sents, 0.1, args.channel, use_semrect=True)
                 trg_real = sents[:, 1:]
                 loss = criterion(output.reshape(-1, output.size(-1)), trg_real.reshape(-1))
                 
@@ -97,9 +91,8 @@ def train_epoch(epoch, args, net, criterion, optimizer, pad_idx):
     for sents in pbar:
         sents = sents.to(device)
         
-        # Random noise level based on SNR range
-        snr = np.random.uniform(args.snr_min, args.snr_max)
-        noise_std = SNR_to_noise(snr)
+        # Random noise level
+        noise_std = np.random.uniform(SNR_to_noise(5), SNR_to_noise(10), size=(1))[0]
         
         # Forward pass
         sents_input = sents[:, :-1]
@@ -107,13 +100,7 @@ def train_epoch(epoch, args, net, criterion, optimizer, pad_idx):
         
         if isinstance(net, DeepSCWithSemRect):
             optimizer.zero_grad()
-            # For SemRectFIM, pass SNR value
-            if args.use_protection == 'semrectfim':
-                snr_tensor = torch.tensor([[snr]], device=device).expand(sents.size(0), 1)
-                output = net(sents, sents, noise_std, args.channel, use_protection=True, snr=snr_tensor)
-            else:
-                output = net(sents, sents, noise_std, args.channel, use_protection=True)
-                
+            output = net(sents, sents, noise_std, args.channel, use_semrect=True)
             loss = criterion(output.reshape(-1, output.size(-1)), sents_target.reshape(-1))
             
             # Apply padding mask
@@ -132,115 +119,28 @@ def train_epoch(epoch, args, net, criterion, optimizer, pad_idx):
     
     return total_loss / len(train_loader)
 
-def train_protection_module(args, model, train_loader):
-    """Train semantic protection module (SemRect or SemRectFIM)"""
-    print(f"Training {args.use_protection.upper()} component...")
+def train_semrect(args, model, train_loader):
+    """Train SemRect with frozen encoder/decoder"""
+    print("Training SemRect component...")
     
-    # Train the protection module
-    model.train_protection_module(
-        train_loader, 
-        epochs=args.protection_epochs, 
-        lr=1e-4, 
-        epsilon=0.1,
-        snr_range=(args.snr_min, args.snr_max)
+    # Freeze all except SemRect
+    for param in model.deepsc.parameters():
+        param.requires_grad = False
+    
+    # Create new optimizer for SemRect
+    semrect_optimizer = torch.optim.Adam(
+        model.semrect.parameters(), lr=1e-4, betas=(0.9, 0.98)
     )
     
+    # Train SemRect
+    model.train_semrect(train_loader, epochs=args.semrect_epochs, lr=1e-4)
+    
     # Save intermediate model
-    torch.save(model.state_dict(), os.path.join(args.checkpoint_path, f'deepsc_with_{args.use_protection}.pth'))
-
-def evaluate_adversarial_robustness(args, model, test_loader):
-    """Evaluate model robustness against adversarial attacks at multiple SNR levels"""
-    results = {}
-    
-    for snr in args.test_snrs:
-        print(f"\nTesting adversarial robustness at SNR = {snr} dB")
-        result = model.test_with_adversarial_attack(
-            test_loader, 
-            epsilon=0.1, 
-            channel_type=args.channel,
-            snr=snr
-        )
-        results[f"snr_{snr}"] = result
-        
-        print(f"Results at SNR = {snr} dB:")
-        print(f"  Protection type: {result['protection_type']}")
-        print(f"  Attack success rate: {result['attack_success_rate']:.4f}")
-        print(f"  BLEU clean: {result['bleu_clean']:.4f}")
-        print(f"  BLEU adversarial: {result['bleu_adversarial']:.4f}")
-        print(f"  BLEU defended: {result['bleu_defended']:.4f}")
-        print(f"  Defense effectiveness: {result['defense_effectiveness']:.4f}")
-    
-    return results
-
-def compare_protection_methods(args):
-    """Compare SemRect and SemRectFIM performance across different SNR levels"""
-    print("\n=== Running comparison between SemRect and SemRectFIM ===")
-    
-    # Prepare dataset
-    vocab = json.load(open(args.vocab_file, 'rb'))
-    token_to_idx = vocab['token_to_idx']
-    num_vocab = len(token_to_idx)
-    pad_idx = token_to_idx["<PAD>"]
-    
-    test_data = EurDataset('test')
-    test_loader = DataLoader(test_data, batch_size=args.batch_size, 
-                           collate_fn=collate_data, num_workers=0)
-    
-    results = {
-        'semrect': {},
-        'semrectfim': {}
-    }
-    
-    # Test each protection method
-    for protection_type in ['semrect', 'semrectfim']:
-        print(f"\nTesting {protection_type.upper()}")
-        
-        # Load or create model
-        model_path = os.path.join(args.checkpoint_path, f'deepsc_with_{protection_type}.pth')
-        
-        model = DeepSCWithSemRect(
-            num_layers=args.num_layers,
-            src_vocab_size=num_vocab,
-            trg_vocab_size=num_vocab,
-            src_max_len=args.MAX_LENGTH,
-            trg_max_len=args.MAX_LENGTH,
-            d_model=args.d_model,
-            num_heads=args.num_heads,
-            dff=args.dff,
-            dropout=0.1,
-            semrect_latent_dim=args.semrect_latent_dim,
-            protection_type=protection_type,
-            device=device
-        ).to(device)
-        
-        if os.path.exists(model_path):
-            print(f"Loading saved {protection_type} model...")
-            model.load_state_dict(torch.load(model_path))
-        else:
-            print(f"No saved {protection_type} model found. Skipping...")
-            continue
-        
-        # Evaluate
-        results[protection_type] = evaluate_adversarial_robustness(args, model, test_loader)
-    
-    # Save comparison results
-    os.makedirs(args.checkpoint_path, exist_ok=True)
-    with open(os.path.join(args.checkpoint_path, 'protection_comparison.json'), 'w') as f:
-        json.dump(results, f, indent=4)
-    
-    return results
+    torch.save(model.state_dict(), os.path.join(args.checkpoint_path, 'deepsc_with_semrect.pth'))
 
 def main():
     args = parser.parse_args()
     args.vocab_file = '/content/data/txt/' + args.vocab_file
-    
-    # Set random seed for reproducibility
-    setup_seed(42)
-
-    """ Run protection method comparison if requested """
-    if args.compare_protections:
-        compare_protection_methods(args)
-        return
 
     """ Prepare dataset and vocab """
     vocab = json.load(open(args.vocab_file, 'rb'))
@@ -249,8 +149,8 @@ def main():
     pad_idx = token_to_idx["<PAD>"]
     
     """ Build model """
-    if args.use_protection != 'none':
-        print(f"Using DeepSC with {args.use_protection.upper()} protection")
+    if args.use_semrect:
+        print("Using DeepSC with SemRect integration")
         model_path = os.path.join(args.checkpoint_path, 'deepsc_pretrained.pth')
         
         if os.path.exists(model_path):
@@ -284,7 +184,6 @@ def main():
                 dff=args.dff,
                 dropout=0.1,
                 semrect_latent_dim=args.semrect_latent_dim,
-                protection_type=args.use_protection,
                 device=device
             ).to(device)
             
@@ -303,7 +202,6 @@ def main():
                 dff=args.dff,
                 dropout=0.1,
                 semrect_latent_dim=args.semrect_latent_dim,
-                protection_type=args.use_protection,
                 device=device
             ).to(device)
     else:
@@ -323,8 +221,8 @@ def main():
                                lr=1e-4, betas=(0.9, 0.98), 
                                eps=1e-8, weight_decay=5e-4)
 
-    """ Stage 1: Pre-train DeepSC without protection """
-    if args.use_protection == 'none':
+    """ Stage 1: Pre-train DeepSC without SemRect """
+    if not args.use_semrect:
         print("Stage 1: Pre-training DeepSC...")
         best_val = float('inf')
         for epoch in range(args.pretrain_epochs):
@@ -336,28 +234,48 @@ def main():
                 os.makedirs(args.checkpoint_path, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(args.checkpoint_path, 'deepsc_pretrained.pth'))
 
-    """ Stage 2: Train protection module with frozen DeepSC """
-    if args.use_protection != 'none':
-        print(f"Stage 2: Training {args.use_protection.upper()} with frozen DeepSC...")
+    """ Stage 2: Train SemRect with frozen DeepSC """
+    if args.use_semrect:
+        print("Stage 2: Training SemRect with frozen DeepSC...")
         train_data = EurDataset('train')
         train_loader = DataLoader(train_data, batch_size=args.batch_size, 
                                collate_fn=collate_data, num_workers=0)
         
-        # Train using dedicated protection module training method
-        train_protection_module(args, model, train_loader)
+        # Freeze encoder/decoder
+        for param in model.deepsc.parameters():
+            param.requires_grad = False
         
-        """ Stage 3: Evaluate against adversarial attacks """
-        print("Stage 3: Evaluating robustness against adversarial attacks...")
-        test_data = EurDataset('test')
-        test_loader = DataLoader(test_data, batch_size=args.batch_size, 
-                               collate_fn=collate_data, num_workers=0)
+        # Train SemRect using its dedicated GAN training method
+        train_semrect(args, model, train_loader)
+
+    """ Stage 3: Fine-tune full model """
+    if args.use_semrect:
+        print("Stage 3: Fine-tuning full DeepSC+SemRect model...")
+        # Unfreeze all parameters
+        for param in model.parameters():
+            param.requires_grad = True
         
-        results = evaluate_adversarial_robustness(args, model, test_loader)
+        # New optimizer for fine-tuning
+        final_optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=5e-5, betas=(0.9, 0.98)
+        )
         
-        # Save results
-        os.makedirs(args.checkpoint_path, exist_ok=True)
-        with open(os.path.join(args.checkpoint_path, f'{args.use_protection}_results.json'), 'w') as f:
-            json.dump(results, f, indent=4)
+        # Load best SemRect model
+        model.load_state_dict(torch.load(os.path.join(args.checkpoint_path, 'deepsc_with_semrect.pth')))
+        
+        best_val = float('inf')
+        for epoch in range(args.finetune_epochs):
+            loss = train_epoch(epoch, args, model, criterion, final_optimizer, pad_idx)
+            val_loss = validate(epoch, args, model, pad_idx, criterion)
+            
+            # Save best model
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), os.path.join(args.checkpoint_path, 'final_with_semrect.pth'))
+        
+        print("Training completed with SemRect integration!")
 
 if __name__ == '__main__':
+    setup_seed(42)  # Set seed for reproducibility
     main()

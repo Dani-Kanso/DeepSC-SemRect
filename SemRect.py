@@ -10,25 +10,39 @@ class SemanticGenerator(nn.Module):
         self.seq_len = seq_len
         self.output_dim = output_dim
         
-        # Simple but effective generator architecture
-        self.main = nn.Sequential(
-            # Expand latent dim to hidden features
+        # Initial projection from latent space
+        self.initial_projection = nn.Sequential(
             nn.Linear(latent_dim, 512),
             nn.LayerNorm(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Project to sequence length × feature dimension
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Deep projection with residual connections
+        self.deep_projection = nn.Sequential(
             nn.Linear(512, 1024),
             nn.LayerNorm(1024),
-            nn.LeakyReLU(0.2, inplace=True),
-            
-            # Final projection to output dimension
-            nn.Linear(1024, seq_len * output_dim),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        
+        # Project to sequence shape
+        self.seq_projection = nn.Linear(1024, seq_len * output_dim)
+        
+        # Self-attention mechanism for refining sequence relationships
+        self.attention = nn.MultiheadAttention(embed_dim=output_dim, num_heads=4, batch_first=True)
+        self.layer_norm1 = nn.LayerNorm(output_dim)
+        self.layer_norm2 = nn.LayerNorm(output_dim)
+        
+        # Feed-forward network for post-attention processing
+        self.ffn = nn.Sequential(
+            nn.Linear(output_dim, output_dim * 2),
+            nn.GELU(),
+            nn.Linear(output_dim * 2, output_dim)
         )
     
     def forward(self, z):
         """
         Forward pass to generate semantic representation from random vector
+        with attention-enhanced sequence processing
         
         Args:
             z: Random latent vector [batch_size, latent_dim]
@@ -36,8 +50,25 @@ class SemanticGenerator(nn.Module):
             Semantic representation [batch_size, seq_len, output_dim]
         """
         batch_size = z.size(0)
-        x = self.main(z)
+        
+        # Initial projections
+        x = self.initial_projection(z)
+        x = self.deep_projection(x)
+        x = self.seq_projection(x)
+        
+        # Reshape to sequence
         x = x.view(batch_size, self.seq_len, self.output_dim)
+        
+        # Apply self-attention for sequence refinement
+        attn_output, _ = self.attention(x, x, x)
+        x = x + attn_output  # Residual connection
+        x = self.layer_norm1(x)
+        
+        # Apply feed-forward network
+        ffn_output = self.ffn(x)
+        x = x + ffn_output  # Residual connection
+        x = self.layer_norm2(x)
+        
         return x
 
 class SemanticDiscriminator(nn.Module):
@@ -95,23 +126,47 @@ class SemRect(nn.Module):
         
         self.to(device) 
     
-    def calibrate(self, h_adv, signature_scale=0.1):
+    def calibrate(self, h_adv, signature_scale=0.1, num_iterations=3):
         """
         Calibrate potentially corrupted semantic representation using 
-        a generated semantic signature.
+        an input-conditioned semantic signature.
         
         Args:
             h_adv: Input semantic representation [batch, seq_len, output_dim]
             signature_scale: Scaling factor for the signature
+            num_iterations: Number of iterations for signature refinement
         """
         batch_size = h_adv.size(0)
         
-        # Generate random vector (z) for semantic signature
-        z = torch.randn(batch_size, self.latent_dim, device=self.device)
-        
-        # Generate semantic signature using the trained generator
+        # Create input-conditioned initial latent vector
+        # Hash the input representation into a seed vector
         with torch.no_grad():
-            signature = self.G(z)
+            # Project input to latent dimension using average pooling and projection
+            pooled = torch.mean(h_adv, dim=1)  # [batch, output_dim]
+            z = torch.tanh(pooled @ torch.randn(self.output_dim, self.latent_dim, device=self.device))
+            
+            # Refine the signature through multiple iterations for better projection
+            best_z = z.clone()
+            best_loss = float('inf')
+            
+            # Iterative refinement to find the best latent code
+            for _ in range(num_iterations):
+                # Add small random noise for exploration
+                z_attempt = z + 0.01 * torch.randn_like(z)
+                
+                # Generate signature
+                signature = self.G(z_attempt)
+                
+                # Calculate reconstruction loss
+                loss = torch.mean((h_adv + signature_scale * signature - h_adv)**2)
+                
+                # Keep best signature
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    best_z = z_attempt.clone()
+            
+            # Generate final signature using best latent code
+            signature = self.G(best_z)
             
         # Apply the signature to calibrate adversarial input
         calibrated = h_adv + signature_scale * signature
@@ -184,7 +239,8 @@ class SemRect(nn.Module):
     def train_gan(self, semantic_encoder, dataloader, epochs=10, lr=1e-4, epsilon=0.1):
         """
         Train SemRect using the GAN approach as described in the paper.
-        Includes adversarial examples generation using FGSM.
+        Includes adversarial examples generation using FGSM and perceptual loss
+        for improved semantic fidelity.
         
         Args:
             semantic_encoder: Function/module to extract semantic representations
@@ -202,6 +258,9 @@ class SemRect(nn.Module):
         # Optimizers
         opt_G = optim.Adam(self.G.parameters(), lr=lr, betas=(0.5, 0.999))
         opt_D = optim.Adam(self.D.parameters(), lr=lr, betas=(0.5, 0.999))
+        
+        # Perceptual similarity is based on the cosine similarity
+        cosine_sim = nn.CosineSimilarity(dim=2)
         
         # For generating adversarial examples
         def generate_adversarial(clean_repr, epsilon=0.1):
@@ -228,7 +287,7 @@ class SemRect(nn.Module):
         
         # Training loop
         for epoch in range(epochs):
-            g_losses, d_losses = [], []
+            g_losses, d_losses, perceptual_losses = [], [], []
             
             for batch in dataloader:
                 # Handle different batch formats
@@ -292,21 +351,33 @@ class SemRect(nn.Module):
                 
                 # Calibration loss (calibrated should be close to clean)
                 calibrated = adv_repr + 0.1 * fake_repr
-                g_loss_cal = self.recon_loss(calibrated, clean_repr)
+                g_loss_recon = self.recon_loss(calibrated, clean_repr)
                 
-                # Total generator loss
-                g_loss = g_loss_adv + 10.0 * g_loss_cal
+                # Perceptual loss based on semantic similarity
+                # Mean across batch but not sequence dimension to preserve semantic structure
+                perceptual_loss = 1.0 - torch.mean(cosine_sim(calibrated, clean_repr))
+                
+                # Feature matching loss - compare intermediate features
+                with torch.no_grad():
+                    real_features = self.D.net[:6](clean_repr.transpose(1, 2))
+                fake_features = self.D.net[:6](calibrated.transpose(1, 2))
+                feature_matching_loss = nn.functional.mse_loss(fake_features, real_features)
+                
+                # Total generator loss with weighted components
+                g_loss = g_loss_adv + 5.0 * g_loss_recon + 2.0 * perceptual_loss + 1.0 * feature_matching_loss
                 g_loss.backward()
                 opt_G.step()
                 
                 # Store losses
                 g_losses.append(g_loss.item())
                 d_losses.append(d_loss.item())
+                perceptual_losses.append(perceptual_loss.item())
             
             # Print epoch stats
             avg_g_loss = sum(g_losses) / max(len(g_losses), 1)
             avg_d_loss = sum(d_losses) / max(len(d_losses), 1)
-            print(f"Epoch {epoch+1}/{epochs}, G_loss: {avg_g_loss:.4f}, D_loss: {avg_d_loss:.4f}")
+            avg_perceptual = sum(perceptual_losses) / max(len(perceptual_losses), 1)
+            print(f"Epoch {epoch+1}/{epochs}, G_loss: {avg_g_loss:.4f}, D_loss: {avg_d_loss:.4f}, Perceptual: {avg_perceptual:.4f}")
             
             # Save checkpoint every few epochs
             if (epoch + 1) % 5 == 0:
